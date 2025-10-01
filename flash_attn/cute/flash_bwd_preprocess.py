@@ -151,6 +151,14 @@ class FlashAttentionBackwardPreprocess:
 
         self._setup_attributes()
 
+        # Suffices to add fake batch dim = 1 mode for bwd preprocess
+        mO = cute.prepend_ones(mO, 4) 
+        mdO = cute.prepend_ones(mdO, 4)
+        mdPsum = cute.prepend_ones(mdPsum, 3)
+        mLSE = cute.prepend_ones(mLSE, 3)
+        mLSElog2 = cute.prepend_ones(mLSElog2, 3)
+        mdQaccum = cute.prepend_ones(mdQaccum, 3)
+
         # grid_dim: (m_block, num_head, batch_size)
         grid_dim = (
             cute.ceil_div(mO.shape[1], self.m_block_size),
