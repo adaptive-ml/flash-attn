@@ -13,6 +13,58 @@ from flash_attn.cute import _flash_attn_bwd, FlashAttentionBackwardPreprocess, F
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
+# Generate lengths
+def generate_varlen_main_bwd_args(
+    m_block_size,
+    batch_size=8,
+    n_heads=16,
+    d_head=128,
+    min_len=32,
+    max_len=64,
+    seqlen_q_eq_kv=True,
+    softmax_scale=1.0 # TODO: Test changing this at some point
+): # Need Q, K, V, dO, dPsum, lse_log2, dq_accum, dK, dV, softmax_scale, cu_seqlen_q, cu_seqlen_k
+
+    torch.manual_seed(0)
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    assert seqlen_q_eq_kv # For now...
+
+    # Figure out which parts of the kernel/computations need to be changed with cuseqlens
+
+    lens_q = torch.randint(low=min_len, high=max_len + 1, size=(batch_size,))
+    if seqlen_q_eq_kv:
+        lens_k = lens_q.clone()
+    else:
+        lens_k = torch.randint(low=min_len, high=max_len + 1, size=(batch_size,))
+    cu_seqlens_q = torch.cat([torch.zeros(1, dtype=torch.int32), lens_q.cumsum(0)])
+    cu_seqlens_k = torch.cat([torch.zeros(1, dtype=torch.int32), lens_k.cumsum(0)])
+
+    total_q = cu_seqlens_q[-1]
+    total_k = cu_seqlens_k[-1]
+
+    # Now cu_seqlens_q and cu_seqlens_k exist
+
+    H = H_kv = n_heads
+    d_head_v = d_head
+
+    q = torch.randn(total_q, H, d_head, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn(total_k, H_kv, d_head, device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn(total_k, H_kv, d_head_v, device=device, dtype=dtype, requires_grad=True)
+
+    total_q_rounded = (total_q + m_block_size - 1) // m_block_size * m_block_size
+
+    dout = torch.randn(total_q, H, d_head_v, device=device, dtype=dtype, requires_grad=True)
+    dpsum = torch.randn(H, total_q_rounded, device=device, dtype=torch.float32, requires_grad=True)
+
+    lse_log2 = torch.ones(H, total_q_rounded, device=device, dtype=torch.float32, requires_grad=True)
+    dq_accum = torch.zeros(H, total_q_rounded * d_head, device=device, dtype=torch.float32, requires_grad=True)
+    dk = torch.empty(total_k, H_kv, d_head, device=device, dtype=dtype, requires_grad=True)
+    dv = torch.empty(total_k, H_kv, d_head, device=device, dtype=dtype, requires_grad=True)
+
+    return q, k, v, dout, dpsum, lse_log2, dq_accum, dk, dv, softmax_scale, cu_seqlens_k, cu_seqlens_q
+
 
 # Generate lengths
 def generate_varlen_bwd_preprocess_args(
@@ -30,37 +82,19 @@ def generate_varlen_bwd_preprocess_args(
 
     assert seqlen_q_eq_kv # For now...
 
-    # lse = (h, total_q)
-    #     - Originally (B, H, seqlen_q)
-
-    # out = (total_q, h, d_head_v)
-    #     - Originally (B, seqlen_q, H, d_head_v)
-    # dout = (total_q, h, d_head_v)
-    #     - Originally (B, seqlen_q, H, d_head_v)
-
-    # dq_accum: (h, total_q * d_head)
-    #     - Originally (B, H , seqlen_q * d_head)
-
-    # dpsum = (h, total_q)
-    #     - Originally (B, H, seqlen_q)
-
     lens_q = torch.randint(low=min_len, high=max_len + 1, size=(batch_size,))
     if seqlen_q_eq_kv:
         lens_k = lens_q.clone()
     else:
         lens_k = torch.randint(low=min_len, high=max_len + 1, size=(batch_size,))
-    cu_seqlens_q = torch.cat([torch.zeros(1, dtype=torch.int32), lens_q.cumsum(0)])
-    cu_seqlens_k = torch.cat([torch.zeros(1, dtype=torch.int32), lens_k.cumsum(0)])
+    cu_seqlens_q = torch.cat([torch.zeros(1, dtype=torch.int32), lens_q.cumsum(0)]).contiguous().to(dtype=torch.int32, device=device)
+    cu_seqlens_k = torch.cat([torch.zeros(1, dtype=torch.int32), lens_k.cumsum(0)]).contiguous().to(dtype=torch.int32, device=device)
 
     total_q = cu_seqlens_q[-1]
     total_k = cu_seqlens_k[-1]
 
     H = H_kv = n_heads
     d_head_v = d_head
-
-    # q = torch.randn(total_q, H, d_head)
-    # k = torch.randn(total_k, H_kv, d_head)
-    # v = torch.randn(total_k, H_kv, d_head_v)
 
     lse = torch.ones(H, total_q, device=device, dtype=torch.float32, requires_grad=True)
     out = torch.randn(total_q, H, d_head_v, device=device, dtype=dtype, requires_grad=True)
@@ -71,7 +105,7 @@ def generate_varlen_bwd_preprocess_args(
     dq_accum = torch.empty(H, total_q_rounded * d_head, device=device, dtype=torch.float32, requires_grad=True)
     dpsum = torch.empty(H, total_q_rounded, device=device, dtype=torch.float32, requires_grad=True)
 
-    return total_q, out, dout, dpsum, lse, lse_log2, dq_accum # , cu_seqlens_q
+    return total_q, out, dout, dpsum, lse, lse_log2, dq_accum
 
 
 # Removes dependence on interface.py
@@ -170,8 +204,11 @@ def main_bwd_caller():
     seqlen_q = seqlen_k = 128
     num_heads = num_heads_kv = 8
     head_dim = head_dim_v = 128
+    min_len = 32
+    max_len = 64
+    seqlen_q_eq_kv = True # TODO: Try to get this working later
 
-    causal = True 
+    causal = False # TODO: Try to get this working later...
     softcap = 0.0
 
     m_block_size: int = 64
@@ -195,49 +232,39 @@ def main_bwd_caller():
 
     # Need q, k, v, do, lse_log2, dpsum, dq_accum, dk, dv, softmax_scale
 
-    # TODO: check if this is the right rounding
-    seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
-    head_dim_rounded = (head_dim + 32 - 1) // 32 * 32
+    # TODO: See what rounding stuff i need to do here
+    # seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
+    # head_dim_rounded = (head_dim + 32 - 1) // 32 * 32
 
     qhead_per_kvhead = num_heads // num_heads_kv
 
-    q = torch.randn(batch_size, seqlen_q, num_heads,   head_dim,  device=device, dtype=dtype, requires_grad=True) / seqlen_q
-    k = torch.randn(batch_size, seqlen_k, num_heads_kv, head_dim,  device=device, dtype=dtype, requires_grad=True) / seqlen_q
-    v = torch.randn(batch_size, seqlen_k, num_heads_kv, head_dim_v, device=device, dtype=dtype, requires_grad=True) / seqlen_q
-    dout = torch.randn(batch_size, seqlen_q, num_heads, head_dim_v,  device=device, dtype=dtype, requires_grad=True) / seqlen_q
-
-
-    dq_accum = torch.zeros(batch_size, num_heads, head_dim_rounded * seqlen_q_rounded,  device=device, dtype=torch.float32, requires_grad=True)
-    dpsum = torch.randn(batch_size, num_heads, seqlen_q_rounded, dtype=torch.float32, device=device)
-    lse_log2 = torch.randn(batch_size, num_heads, seqlen_q_rounded,  device=device, dtype=torch.float32, requires_grad=True)
-
-    softmax_scale = 1.0 / math.sqrt(head_dim)
+    (
+        q, 
+        k, 
+        v, 
+        dout, 
+        dpsum, 
+        lse_log2, 
+        dq_accum, 
+        dk, 
+        dv, 
+        softmax_scale, 
+        cu_seqlens_k, 
+        cu_seqlens_q
+    ) = generate_varlen_main_bwd_args(
+        m_block_size, 
+        batch_size, 
+        num_heads, 
+        head_dim, 
+        min_len, 
+        max_len, 
+        seqlen_q_eq_kv, 
+        softmax_scale
+    )
 
     q, k, v, dout, lse_log2 = [maybe_contiguous(t) for t in (q, k, v, dout, lse_log2)]
 
-    # 2. Relevant Asserts from interface.py
-    assert k.shape == (batch_size, seqlen_k, num_heads_kv, head_dim)
-    assert v.shape == (batch_size, seqlen_k, num_heads_kv, head_dim_v)
-    assert dout.shape == (batch_size, seqlen_q, num_heads, head_dim_v)
-    assert lse_log2.shape == (batch_size, num_heads, seqlen_q), "lse must have shape (batch_size, num_head, seqlen_q)"
-    assert q.dtype in [torch.float16, torch.bfloat16], "inputs must be float16 or bfloat16"
-    assert q.dtype == k.dtype == v.dtype == dout.dtype, "inputs must have the same dtype"
-    assert lse_log2.dtype == torch.float32, "lse must be float32"
-    assert all(t.is_cuda for t in (q, k, v, dout, lse_log2)), "inputs must be on CUDA device"
-    assert num_heads % num_heads_kv == 0, "num_head must be divisible by num_head_kv"
-    assert head_dim <= 256, "head_dim must be less than or equal to 256"
-    alignment = 16 // q.element_size()
-    assert head_dim % alignment == 0, f"head_dim must be divisible by {alignment}"
-    assert head_dim_v % alignment == 0, f"head_dim_v must be divisible by {alignment}"
-
-
-    device = q.device
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(v)
-
     # 3. Not strictly needed, but for simplicity
-    assert seqlen_q_rounded == seqlen_q
-    assert head_dim == head_dim_rounded
     assert qhead_per_kvhead == 1
 
     # for now ignoring MQA/GQA
@@ -246,30 +273,17 @@ def main_bwd_caller():
     #     head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
     #     dk_accum = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded * head_dim_rounded, dtype=torch.float32, device=device)
     #     dv_accum = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded * head_dim_v_rounded, dtype=torch.float32, device=device)
-
     # 4. torch to dlpack
-    dtype = torch2cute_dtype_map[q.dtype]
+
     q_tensor, k_tensor, v_tensor, do_tensor, dk_tensor, dv_tensor = [
-        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
+        utils.convert_from_dlpack(t.detach(), leading_dim=t.ndim - 1, alignment=16, divisibility=8)
         for t in (q, k, v, dout, dk, dv)
     ]
-
     dq_accum_tensor, dpsum_tensor, lse_log2_tensor = [
-        from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=2)
+        utils.convert_from_dlpack(t.detach(), leading_dim=t.ndim - 1, alignment=16, divisibility=4)
         for t in (dq_accum, dpsum, lse_log2)
     ]
 
-    # o_tensor = o_tensor.mark_compact_shape_dynamic(mode=3, divisibility=8)
-    do_tensor = do_tensor.mark_compact_shape_dynamic(mode=3, divisibility=8)
-    q_tensor = q_tensor.mark_compact_shape_dynamic(mode=3, divisibility=8)
-    k_tensor = k_tensor.mark_compact_shape_dynamic(mode=3, divisibility=8)
-    v_tensor = v_tensor.mark_compact_shape_dynamic(mode=3, divisibility=8)
-    lse_log2_tensor = lse_log2_tensor.mark_compact_shape_dynamic(mode=2, divisibility=4)
-    dpsum_tensor = dpsum_tensor.mark_compact_shape_dynamic(mode=2, divisibility=4)
-
-    # dq_tensor = dq_tensor.mark_compact_shape_dynamic(mode=3, divisibility=8)
-    dk_tensor = dk_tensor.mark_compact_shape_dynamic(mode=3, divisibility=8)
-    dv_tensor = dv_tensor.mark_compact_shape_dynamic(mode=3, divisibility=8)
 
     # for now ignoring MQA/GQA
     # if qhead_per_kvhead > 1:
@@ -277,6 +291,11 @@ def main_bwd_caller():
     #         from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=2)
     #         for t in (dk_accum, dv_accum)
     #     ]
+
+    cu_seqlens_q_tensor, cu_seqlens_k_tensor = [
+        from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0) if t is not None else None
+        for t in (cu_seqlens_q, cu_seqlens_k)
+    ]
 
     # 5. Kernel compilation
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -314,7 +333,10 @@ def main_bwd_caller():
             dq_accum_tensor,
             dk_tensor, # if qhead_per_kvhead == 1 else dk_accum_tensor,
             dv_tensor, # if qhead_per_kvhead == 1 else dv_accum_tensor,
-            softmax_scale, current_stream
+            softmax_scale, 
+            current_stream,
+            cu_seqlens_q_tensor,
+            cu_seqlens_k_tensor,
         )
 
     # 6. Kernel Call
@@ -323,7 +345,10 @@ def main_bwd_caller():
         dq_accum_tensor,
         dk_tensor, # if qhead_per_kvhead == 1 else dk_accum_tensor,
         dv_tensor, # if qhead_per_kvhead == 1 else dv_accum_tensor,
-        softmax_scale, current_stream
+        softmax_scale, 
+        current_stream,
+        cu_seqlens_q_tensor,
+        cu_seqlens_k_tensor,
     )
 
     # 7. Verification
@@ -346,5 +371,5 @@ def _stats_single(name, a):
     
 
 if __name__ == "__main__":
-    preprocess_caller()
-    # main_bwd_caller()
+    # preprocess_caller()
+    main_bwd_caller()

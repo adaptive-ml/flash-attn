@@ -141,6 +141,8 @@ class FlashAttentionBackwardSm80:
         mdQaccum_type: Type[cutlass.Numeric],
         mdK_type: Type[cutlass.Numeric],
         mdV_type: Type[cutlass.Numeric],
+        mCuSeqlensQ_type: Type[cutlass.Numeric] | None,
+        mCuSeqlensK_type: Type[cutlass.Numeric] | None,
     ):
         if cutlass.const_expr(not (mQ_type == mK_type == mV_type == mdO_type)):
             raise TypeError("All tensors must have the same data type")
@@ -158,6 +160,10 @@ class FlashAttentionBackwardSm80:
             raise TypeError("dPsum tensor must be Float32")
         if cutlass.const_expr(not mdQaccum_type in [cutlass.Float32]):
             raise TypeError("dQaccum tensor must be Float32")
+        if cutlass.const_expr(mCuSeqlensQ_type not in [None, cutlass.Int32]):
+            raise TypeError("cu_seqlens_q tensor must be Int32")
+        if cutlass.const_expr(mCuSeqlensK_type not in [None, cutlass.Int32]):
+            raise TypeError("cu_seqlens_k tensor must be Int32")
         assert mQ_type == self.dtype
 
     def _setup_attributes(self):
@@ -343,13 +349,17 @@ class FlashAttentionBackwardSm80:
         mdV: cute.Tensor,
         softmax_scale: cutlass.Float32,
         stream: cuda.CUstream,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
+        mCuSeqlensK: Optional[cute.Tensor] = None,
     ):
         # Get the data type and check if it is fp16 or bf16
         self._check_type(*(t.element_type if t is not None else None
-                           for t in (mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV)))
+                           for t in (mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV, mCuSeqlensQ, mCuSeqlensK)))
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
         tiled_mma_sdp, tiled_mma_dkv, tiled_mma_dq = self._get_tiled_mma()
+
+        # Cannot bypass worktile scheduler, since otherwise it is hard for us to know batch idx
         # grid_dim: (n_block, num_head, batch_size)
         grid_dim = (
             cute.ceil_div(mK.shape[1], self.n_block_size),
@@ -367,6 +377,8 @@ class FlashAttentionBackwardSm80:
             mdQaccum,
             mdK,
             mdV,
+            mCuSeqlensQ,
+            mCuSeqlensK,
             softmax_scale,
             softmax_scale_log2,
             self.sQ_layout,
@@ -405,6 +417,8 @@ class FlashAttentionBackwardSm80:
         mdQaccu: cute.Tensor,
         mdK: cute.Tensor,
         mdV: cute.Tensor,
+        mCuSeqlensQ: Optional[cute.Tensor],
+        mCuSeqlensK: Optional[cute.Tensor],
         softmax_scale: cutlass.Float32,
         softmax_scale_log2: cutlass.Float32,
         sQ_layout: cute.ComposedLayout,
@@ -428,6 +442,10 @@ class FlashAttentionBackwardSm80:
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
         n_block, head_idx, batch_idx = cute.arch.block_idx()
+
+        # TODO: start adding work tile stuff from here
+        # if cutlass.const_expr(mCuSeqlensQ is not None):
+        #     batch_idx = get_batch_idx()
 
         m_block_max = cute.ceil_div(mQ.shape[1], self.m_block_size)
         m_block_min = 0
