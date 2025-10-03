@@ -164,6 +164,9 @@ class FlashAttentionBackwardPostprocess:
         )
         self.tiled_mma = tiled_mma
 
+        mdQaccum = cute.prepend_ones(mdQaccum, 3)
+        mdQ = cute.prepend_ones(mdQ, 4)
+
         self._setup_attributes()
 
         smem_size = max(

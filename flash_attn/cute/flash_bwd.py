@@ -561,7 +561,7 @@ class FlashAttentionBackwardSm80:
                 mLSE_cur = cute.domain_offset((seqlen.offset_q,), mLSE[head_idx, None])
                 mdO_cur = cute.domain_offset((seqlen.offset_q, 0), mdO[None, head_idx, None])
                 mdPsum_cur = cute.domain_offset((seqlen.offset_q,), mdPsum[head_idx, None])
-                mdQaccu_cur = cute.domain_offset((seqlen.offset_q,), mdQaccu[head_idx, None])
+                mdQaccu_cur = cute.domain_offset((seqlen.offset_q * self.head_dim_padded,), mdQaccu[head_idx, None])
             head_idx_kv = head_idx # head_idx // self.qhead_per_kvhead if cutlass.const_expr(not self.pack_gqa) else head_idx
 
             if cutlass.const_expr(not seqlen.has_cu_seqlens_k):
