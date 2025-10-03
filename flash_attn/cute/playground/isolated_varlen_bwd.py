@@ -43,6 +43,9 @@ def generate_varlen_main_bwd_args(
 
     total_q = cu_seqlens_q[-1]
     total_k = cu_seqlens_k[-1]
+    
+    cu_seqlens_q = cu_seqlens_q.contiguous().to(dtype=torch.int32, device=device)
+    cu_seqlens_k = cu_seqlens_k.contiguous().to(dtype=torch.int32, device=device)
 
     # Now cu_seqlens_q and cu_seqlens_k exist
 
@@ -259,7 +262,7 @@ def main_bwd_caller():
         min_len, 
         max_len, 
         seqlen_q_eq_kv, 
-        softmax_scale
+        # softmax_scale
     )
 
     q, k, v, dout, lse_log2 = [maybe_contiguous(t) for t in (q, k, v, dout, lse_log2)]
@@ -309,7 +312,7 @@ def main_bwd_caller():
     )
     if compile_key not in _flash_attn_bwd.compile_cache:
         fa_bwd_sm80 = FlashAttentionBackwardSm80(
-            dtype,
+            torch2cute_dtype_map[dtype],
             head_dim,
             head_dim_v,
             qhead_per_kvhead,
