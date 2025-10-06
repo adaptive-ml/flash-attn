@@ -1,6 +1,6 @@
 # Copyright (c) 2025, Tri Dao.
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 from dataclasses import dataclass, fields
 
 import cutlass
@@ -51,6 +51,21 @@ class TileSchedulerArguments(ParamsBase):
     element_size: cutlass.Constexpr[int] = 2
     is_persistent: cutlass.Constexpr[bool] = False
     lpt: cutlass.Constexpr[bool] = False
+
+@dataclass
+class TileSchedulerArgumentsBwd(ParamsBase):
+    num_block: Int32
+    num_head: Int32
+    num_batch: Int32
+    headdim: Int32
+    headdim_v: Int32
+    total_k: Int32
+    tile_shape_mn: cutlass.Constexpr[Tuple[int, int]]
+    mCuSeqlensK: cute.Tensor
+    qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
+    element_size: cutlass.Constexpr[int] = 2
+    # is_persistent: cutlass.Constexpr[bool] = False
+    # lpt: cutlass.Constexpr[bool] = False
 
 
 class SingleTileScheduler:
@@ -320,13 +335,34 @@ class SingleTileVarlenScheduler:
     class Params(ParamsBase):
         num_head: Int32
         num_batch: Int32
-        total_q: Int32
-        max_kvblock_in_l2: Int32
         tile_shape_mn: cutlass.Constexpr[Tuple[int, int]]
+        total_q: Int32 = 0
+        total_k: Int32 = 0
+        max_kvblock_in_l2: Int32 = 0
         mCuSeqlensQ: Optional[cute.Tensor] = None
+        mCuSeqlensK: Optional[cute.Tensor] = None
         mSeqUsedQ: Optional[cute.Tensor] = None
         qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
         lpt: cutlass.Constexpr[bool] = False
+        is_bwd: cutlass.Constexpr[bool] = False
+
+        @staticmethod
+        @cute.jit
+        def create_bwd(
+            args: TileSchedulerArgumentsBwd, *, loc=None, ip=None
+        ) -> "SingleTileVarlenScheduler.Params":
+            assert args.mCuSeqlensK is not None, (
+                "mCuSeqlensK must be provided"
+            )
+            return SingleTileVarlenScheduler.Params(
+                num_head=args.num_head,
+                num_batch=args.num_batch,
+                total_k=args.total_k,
+                tile_shape_mn=args.tile_shape_mn,
+                mCuSeqlensK=args.mCuSeqlensK,
+                qhead_per_kvhead_packgqa=args.qhead_per_kvhead_packgqa,
+                is_bwd=True
+            )
 
         @staticmethod
         @cute.jit
@@ -358,8 +394,19 @@ class SingleTileVarlenScheduler:
         self._ip = ip
 
     @staticmethod
-    def to_underlying_arguments(args: TileSchedulerArguments, *, loc=None, ip=None) -> Params:
-        return SingleTileVarlenScheduler.Params.create(args, loc=loc, ip=ip)
+    def to_underlying_arguments(
+        args: Union["TileSchedulerArguments", "TileSchedulerArgumentsBwd"], *, loc=None, ip=None
+    ) -> "SingleTileVarlenScheduler.Params":
+        # If Bwd is a subclass of the forward args, check it first.
+        if isinstance(args, TileSchedulerArgumentsBwd):
+            return SingleTileVarlenScheduler.Params.create_bwd(args, loc=loc, ip=ip)
+        elif isinstance(args, TileSchedulerArguments):
+            return SingleTileVarlenScheduler.Params.create(args, loc=loc, ip=ip)
+        else:
+            raise TypeError(
+                f"Unsupported args type: {type(args).__name__}. "
+                "Expected TileSchedulerArguments or TileSchedulerArgumentsBwd."
+            )
 
     @staticmethod
     def create(params: Params, *, loc=None, ip=None) -> "SingleTileVarlenScheduler":
@@ -374,9 +421,16 @@ class SingleTileVarlenScheduler:
         loc=None,
         ip=None,
     ) -> Tuple[Int32, Int32, Int32]:
-        total_blocks_max = (
-            params.total_q + params.num_batch * (params.tile_shape_mn[0] - 1)
-        ) // params.tile_shape_mn[0]
+        
+        if cutlass.const_expr(params.is_bwd):
+            total_blocks_max = (
+                params.total_k + params.num_batch * (params.tile_shape_mn[1] - 1)
+            ) // params.tile_shape_mn[1]
+        else:
+            total_blocks_max = (
+                params.total_q + params.num_batch * (params.tile_shape_mn[0] - 1)
+            ) // params.tile_shape_mn[0]
+
         return (total_blocks_max * params.num_head, Int32(1), Int32(1))
 
     @cute.jit
@@ -403,15 +457,37 @@ class SingleTileVarlenScheduler:
         )
 
     @cute.jit
+    def _get_num_n_blocks(self, lane: Int32, bidb_start: Int32) -> Int32:
+        params = self.params
+        batch_idx = lane + bidb_start
+
+        assert params.mCuSeqlensK is not None
+
+        cur_cu_seqlen = Int32(0)
+        if batch_idx <= params.num_batch:
+            cur_cu_seqlen = params.mCuSeqlensK[batch_idx]
+
+        next_cu_seqlen = cute.arch.shuffle_sync_down(cur_cu_seqlen, offset=1)
+        seqlen = next_cu_seqlen - cur_cu_seqlen
+
+        # if cutlass.const_expr(params.qhead_per_kvhead_packgqa > 1):
+        #     seqlen *= params.qhead_per_kvhead_packgqa
+
+        return (
+            cute.ceil_div(seqlen, params.tile_shape_mn[1])
+            if batch_idx < params.num_batch and lane < cute.arch.WARP_SIZE - 1
+            else Int32(0)
+        )
+
+    @cute.jit
     def get_current_work(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
         params = self.params
         lane_idx = cute.arch.lane_idx()
-        num_m_blocks = self._get_num_m_blocks(lane_idx, bidb_start=0)
-        num_m_blocks_cumulative = utils.warp_prefix_sum(num_m_blocks, lane_idx)
-        # Total number of blocks for the next 31 batches
-        m_blocks_in_group = cute.arch.shuffle_sync(num_m_blocks_cumulative, cute.arch.WARP_SIZE - 1)
-        # Same for all lanes
-        group_end_tile = m_blocks_in_group * params.num_head
+        num_blocks = self._get_num_n_blocks(lane_idx, bidb_start=0) if cutlass.const_expr(params.is_bwd) else self._get_num_m_blocks(lane_idx, bidb_start=0)
+        # Total number of blocks for the first 31 batches
+        num_blocks_cumulative = utils.warp_prefix_sum(num_blocks, lane_idx)
+        blocks_in_group = cute.arch.shuffle_sync(num_blocks_cumulative, cute.arch.WARP_SIZE - 1)
+        group_end_tile = blocks_in_group * params.num_head
         # if cute.arch.thread_idx()[0] == 128 + 31: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, group_end_tile = %d, num_m_blocks=%d, num_m_blocks_cumulative = %d, m_blocks_in_group = %d", self._tile_idx, group_end_tile, num_m_blocks, num_m_blocks_cumulative, m_blocks_in_group)
         block, head_idx, batch_idx = Int32(0), Int32(0), Int32(0)
         next_tile_idx = self._tile_idx
@@ -421,44 +497,45 @@ class SingleTileVarlenScheduler:
                 batch_idx = Int32(params.num_batch)
                 group_end_tile = next_tile_idx + 1
             else:
-                num_m_blocks = self._get_num_m_blocks(lane_idx, bidb_start=batch_idx)
-                num_m_blocks_cumulative = utils.warp_prefix_sum(num_m_blocks, lane_idx)
-                m_blocks_in_group = cute.arch.shuffle_sync(
-                    num_m_blocks_cumulative, cute.arch.WARP_SIZE - 1
+                num_blocks = self._get_num_n_blocks(lane_idx, bidb_start=0) if cutlass.const_expr(params.is_bwd) else self._get_num_m_blocks(lane_idx, bidb_start=0)
+                num_blocks_cumulative = utils.warp_prefix_sum(num_blocks, lane_idx)
+                blocks_in_group = cute.arch.shuffle_sync(
+                    num_blocks_cumulative, cute.arch.WARP_SIZE - 1
                 )
-                group_end_tile += m_blocks_in_group * params.num_head
+                group_end_tile += blocks_in_group * params.num_head
         is_valid = False
         if batch_idx >= params.num_batch:
             block, head_idx, batch_idx = Int32(0), Int32(0), Int32(params.num_batch)
         else:
-            group_start_tile = group_end_tile - m_blocks_in_group * params.num_head
+            group_start_tile = group_end_tile - blocks_in_group * params.num_head
             # if cute.arch.thread_idx()[0] == 128 + 31: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, group_end_tile = %d, num_m_blocks=%d, batch_idx = %d", self._tile_idx, group_end_tile, num_m_blocks, batch_idx)
             # The next problem to process is the first one that does not have ending tile position
             # that is greater than or equal to tile index.
             batch_idx_in_group = cute.arch.popc(
                 cute.arch.vote_ballot_sync(
-                    group_start_tile + num_m_blocks_cumulative * params.num_head <= next_tile_idx
+                    group_start_tile + num_blocks_cumulative * params.num_head <= next_tile_idx
                 )
             )
             batch_idx += batch_idx_in_group
-            num_m_blocks_prev_lane = (
+            num_blocks_prev_lane = (
                 0
                 if batch_idx_in_group == 0
-                else cute.arch.shuffle_sync(num_m_blocks_cumulative, batch_idx_in_group - 1)
+                else cute.arch.shuffle_sync(num_blocks_cumulative, batch_idx_in_group - 1)
             )
-            num_m_blocks = cute.arch.shuffle_sync(num_m_blocks, batch_idx_in_group)
-            mh_block = next_tile_idx - group_start_tile - num_m_blocks_prev_lane * params.num_head
+            num_blocks = cute.arch.shuffle_sync(num_blocks, batch_idx_in_group)
+            mh_block = next_tile_idx - group_start_tile - num_blocks_prev_lane * params.num_head
             if cutlass.const_expr(params.lpt):
+                assert cutlass.const_expr(not params.is_bwd) # For now
                 # This is a version of the SingleTileLPTScheduler, complicated by the fact that
                 # the seqlen can vary per batch.
                 # TODO: is there any case where num_m_blocks is 0?
                 # TODO: by right we should read the seqlen_kv but we're assuming seqlen_q == seqlen_k here
-                num_n_blocks = num_m_blocks * params.tile_shape_mn[0] // params.qhead_per_kvhead_packgqa // params.tile_shape_mn[1]
+                num_n_blocks = num_blocks * params.tile_shape_mn[0] // params.qhead_per_kvhead_packgqa // params.tile_shape_mn[1]
                 # nheads_in_l2 = min(max(self.max_kvblock_in_l2 // num_n_blocks, 1), self.num_head)
                 # Seems faster to have this be a power of 2
                 nheads_in_l2 = 16 if num_n_blocks * 16 <= params.max_kvblock_in_l2 else (8 if num_n_blocks * 8 <= params.max_kvblock_in_l2 else (4 if num_n_blocks * 4 <= params.max_kvblock_in_l2 else (2 if num_n_blocks * 2 <= params.max_kvblock_in_l2 else 1)))
                 nheads_in_l2 = min(nheads_in_l2, params.num_head)
-                mh_in_l2 = nheads_in_l2 * num_m_blocks
+                mh_in_l2 = nheads_in_l2 * num_blocks
                 section_idx = mh_block // mh_in_l2
                 l2_mod = mh_block - section_idx * mh_in_l2
                 # Deal with tail section
@@ -466,10 +543,10 @@ class SingleTileVarlenScheduler:
                 block = l2_mod // nheads_in_this_section
                 head_idx_residual = l2_mod - block * nheads_in_this_section
                 head_idx = section_idx * nheads_in_l2 + head_idx_residual
-                block = num_m_blocks - 1 - block
+                block = num_blocks - 1 - block
             else:
-                head_idx = mh_block // num_m_blocks
-                block = mh_block - head_idx * num_m_blocks
+                head_idx = mh_block // num_blocks
+                block = mh_block - head_idx * num_blocks
             is_valid = self._is_first_block and batch_idx < params.num_batch
         # if cute.arch.thread_idx()[0] == 128: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, batch_idx=%d, head_idx=%d, block=%d, is_valid = %d", self._tile_idx, batch_idx, head_idx, block, is_valid)
         return cutlass.utils.WorkTileInfo(

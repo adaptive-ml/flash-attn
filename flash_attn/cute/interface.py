@@ -258,6 +258,8 @@ def _flash_attn_bwd(
     *,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
@@ -349,6 +351,10 @@ def _flash_attn_bwd(
             utils.convert_from_dlpack(t.detach(), leading_dim=t.ndim - 1, alignment=16, divisibility=4)
             for t in (dk_accum, dv_accum)
         ]
+    cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor = [
+        from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0) if t is not None else None
+        for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+    ]
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1), lse * log2_e, and zero out dq_accum.
@@ -366,8 +372,7 @@ def _flash_attn_bwd(
         o_tensor, do_tensor, dpsum_tensor, lse_tensor, lse_log2_tensor, dq_accum_tensor, current_stream
     )
 
-    if cu_seqlens_q is not None:
-        return dq, dk, dv
+    # Now need to support cuseqlen_q and k for bwd...
 
     # Backward kernel: compute dk, dv, dq_accum.
     compile_key = (
@@ -401,15 +406,29 @@ def _flash_attn_bwd(
             dq_accum_tensor,
             dk_tensor if qhead_per_kvhead == 1 else dk_accum_tensor,
             dv_tensor if qhead_per_kvhead == 1 else dv_accum_tensor,
-            softmax_scale, current_stream
+            softmax_scale,
+            current_stream,
+            cu_seqlens_q_tensor,
+            cu_seqlens_k_tensor,
+            seqused_q_tensor,
+            seqused_k_tensor,
         )
     _flash_attn_bwd.compile_cache[compile_key](
         q_tensor, k_tensor, v_tensor, do_tensor, lse_log2_tensor, dpsum_tensor,
         dq_accum_tensor,
         dk_tensor if qhead_per_kvhead == 1 else dk_accum_tensor,
         dv_tensor if qhead_per_kvhead == 1 else dv_accum_tensor,
-        softmax_scale, current_stream
+        softmax_scale, 
+        current_stream,
+        cu_seqlens_q_tensor,
+        cu_seqlens_k_tensor,
+        seqused_q_tensor,
+        seqused_k_tensor,
     )
+
+    # For now
+    if cu_seqlens_q is not None:
+        return dq, dk, dv
 
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
     compile_key_post = (dtype, head_dim, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB)
