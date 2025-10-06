@@ -426,10 +426,7 @@ def _flash_attn_bwd(
         seqused_k_tensor,
     )
 
-    # For now
-    if cu_seqlens_q is not None:
-        return dq, dk, dv
-
+    # Never uses SM90
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
     compile_key_post = (dtype, head_dim, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB)
     if compile_key_post not in _flash_attn_bwd.compile_cache_post:
@@ -579,7 +576,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         assert seqused_q == seqused_k == None
         assert ctx.causal == False
         assert ctx.softcap == 0.0
-        assert ctx.softmax_scale == None
+        # assert ctx.softmax_scale == None
         dq, dk, dv = _flash_attn_bwd(
             q,
             k,
@@ -592,8 +589,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.softcap,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
-            seqused_q=seqused_q,
-            seqused_k=seqused_k,
+            # seqused_q=seqused_q,
+            # seqused_k=seqused_k,
         )
 
         return dq, dk, dv, *((None,) * 11)
