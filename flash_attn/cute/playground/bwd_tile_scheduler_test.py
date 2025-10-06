@@ -43,13 +43,12 @@ class SchedulerTest:
             element_size=self.element_size,
         )
 
-        params = SingleTileVarlenScheduler.to_underlying_arguments(args) # passed in directly to kernel
+        params = SingleTileVarlenScheduler.to_underlying_arguments(args)
 
         grid_dim = SingleTileVarlenScheduler.get_grid_shape(params)
 
         cute.printf("Grid Dim is {}", grid_dim)
 
-        # call kernel here
         self.kernel(
             params,
         ).launch(
@@ -79,9 +78,9 @@ class SchedulerTest:
                 batch_idx,
                 work_tile.is_valid_tile,
             )
-            # out_triplets[bid, 0] = n_block   # block
-            # out_triplets[bid, 1] = head_idx   # head
-            # out_triplets[bid, 2] = batch_idx   # batch
+            # out_triplets[bid, 0] = n_block
+            # out_triplets[bid, 1] = head_idx
+            # out_triplets[bid, 2] = batch_idx
             # out_valid[bid] = cutlass.Int32(1) if work_tile.is_valid_tile else cutlass.Int32(0)
 
 
@@ -110,7 +109,6 @@ def setup_caller(
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    # Compile and run
     compiled_func = cute.compile(scheduler_test,
         num_block=num_block,
         num_head=num_head,
@@ -139,7 +137,6 @@ def setup_caller(
 
 
 
-# Generate Lengths
 def generate_varlen_bwd_seqlens(
     batch_size=8,
     min_len=32,
