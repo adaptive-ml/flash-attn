@@ -12,6 +12,8 @@ def torch_flash_ref(
         cu_seqlens_k: torch.Tensor = None, 
         seqused_q: torch.Tensor = None,
         seqused_k: torch.Tensor = None,
+        total_q: int = 0,
+        total_k: int = 0,
         softmax_scale: Optional[float] = None, 
         causal: bool = False, 
     ):
@@ -31,7 +33,7 @@ def torch_flash_ref(
 
     if cu_seqlens_q is not None:
         assert cu_seqlens_q.dim() == 1
-        assert cu_seqlens_q[-1] == q.shape[0]
+        assert total_q == q.shape[0]
         assert q.dim() == 3
         H = q.shape[1]
         B = cu_seqlens_q.shape[0] - 1
@@ -42,7 +44,7 @@ def torch_flash_ref(
 
     if cu_seqlens_k is not None:
         assert cu_seqlens_k.dim() == 1
-        assert cu_seqlens_k[-1] == k.shape[0] == v.shape[0]
+        assert total_k == k.shape[0] == v.shape[0]
         assert k.dim() == v.dim() == 3
         H_kv = k.shape[1]
         B_kv = cu_seqlens_k.shape[0] - 1
@@ -73,16 +75,19 @@ def torch_flash_ref(
     assert H == H_kv
     assert d == d_v
 
+    hcseq_q = cu_seqlens_q.to(device='cpu')
+    hcseq_k = cu_seqlens_k.to(device='cpu')
+
     outs = []
     for b in range(B):
-        if cu_seqlens_q is not None:
-            q_start, q_end = int(cu_seqlens_q[b]), int(cu_seqlens_q[b+1])
+        if hcseq_q is not None:
+            q_start, q_end = int(hcseq_q[b]), int(hcseq_q[b+1])
             qb = q[q_start:q_end]        
         else:
             qb = q[b]
 
-        if cu_seqlens_k is not None:
-            k_start, k_end = int(cu_seqlens_k[b]), int(cu_seqlens_k[b+1])
+        if hcseq_k is not None:
+            k_start, k_end = int(hcseq_k[b]), int(hcseq_k[b+1])
             kb = k[k_start:k_end]
             vb = v[k_start:k_end]
         else:
@@ -152,6 +157,7 @@ def generate_varlen_args(
 
     total_q = cu_seqlens_q[-1]
     total_k = cu_seqlens_k[-1]
+    hcseqk = cu_seqlens_k.clone()
     
     cu_seqlens_q = cu_seqlens_q.contiguous().to(dtype=torch.int32, device=device)
     cu_seqlens_k = cu_seqlens_k.contiguous().to(dtype=torch.int32, device=device)
@@ -162,7 +168,23 @@ def generate_varlen_args(
     d_head_v = d_head
 
     q = torch.randn(total_q, H, d_head, device=device, dtype=dtype, requires_grad=True)
+    # hk = torch.zeros(total_k, H_kv, d_head, dtype=dtype)
+    # start0 = hcseqk[0].item()
+    # end0   = hcseqk[1].item()
+    # start1 = hcseqk[1].item()
+    # end1   = hcseqk[2].item()
+
+    # # hk[start0:end0] = 1
+    # # hk[start1:end1] = 2
+    # ramp = 0.1 * torch.arange(d_head, dtype=hk.dtype)
+
+    # # expand to match (seq_len, H_kv, d_head)
+    # hk[start0:end0] = ramp
+    # hk[start1:end1] = 2 * ramp
+
+    # k = hk.to(device=device).requires_grad_()
+    
     k = torch.randn(total_k, H_kv, d_head, device=device, dtype=dtype, requires_grad=True)
     v = torch.randn(total_k, H_kv, d_head_v, device=device, dtype=dtype, requires_grad=True)
 
-    return q, k, v, cu_seqlens_q, cu_seqlens_k
+    return q, k, v, cu_seqlens_q, cu_seqlens_k, total_q, total_k

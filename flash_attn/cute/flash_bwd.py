@@ -384,7 +384,7 @@ class FlashAttentionBackwardSm80:
             tile_sched_args = TileSchedulerArgumentsBwd(
                 num_block=0, # TODO: Unused, clean up
                 num_head=cute.size(mK.shape[1]),
-                num_batch=cute.size(mCuSeqlensK.shape[0]),
+                num_batch=cute.size(mCuSeqlensK.shape[0]) - 1,
                 headdim=cute.size(mK.shape[2]),
                 headdim_v=cute.size(mV.shape[2]),
                 total_k=cute.size(mK.shape[0]),
@@ -498,12 +498,13 @@ class FlashAttentionBackwardSm80:
 
         if work_tile.is_valid_tile:
             # n_block, head_idx, batch_idx = cute.arch.block_idx()
+            seqlen = SeqlenInfoQK(batch_idx, mQ.shape[1], mK.shape[1], mCuSeqlensQ=mCuSeqlensQ, mCuSeqlensK=mCuSeqlensK)
 
-            m_block_max = cute.ceil_div(mQ.shape[1], self.m_block_size)
+            m_block_max = cute.ceil_div(seqlen.seqlen_q, self.m_block_size)
             m_block_min = 0
             if cutlass.const_expr(self.is_causal):
                 m_block_min = max(
-                    (n_block * self.n_block_size + mQ.shape[1] - mK.shape[1]) // self.m_block_size,
+                    (n_block * self.n_block_size + seqlen.seqlen_q - seqlen.seqlen_k) // self.m_block_size,
                     m_block_min,
                 )
             # TODO: return early if m_block_max == 0
@@ -516,7 +517,7 @@ class FlashAttentionBackwardSm80:
             blkV_shape = (self.n_block_size, self.head_dim_v_padded)
             blkdO_shape = (self.m_block_size, self.head_dim_v_padded)
 
-            seqlen = SeqlenInfoQK(batch_idx, mQ.shape[1], mK.shape[1], mCuSeqlensQ=mCuSeqlensQ, mCuSeqlensK=mCuSeqlensK)
+            # seqlen = SeqlenInfoQK(batch_idx, mQ.shape[1], mK.shape[1], mCuSeqlensQ=mCuSeqlensQ, mCuSeqlensK=mCuSeqlensK)
 
             # From fwd. TODO: Make sure seqused is also transferred over
             if cutlass.const_expr(not seqlen.has_cu_seqlens_q):
@@ -533,6 +534,7 @@ class FlashAttentionBackwardSm80:
                 mdO_cur = cute.domain_offset((seqlen.offset_q, 0), mdO[None, head_idx, None])
                 mdPsum_cur = cute.domain_offset((seqlen.offset_q,), mdPsum[head_idx, None])
                 mdQaccu_cur = cute.domain_offset((seqlen.offset_q * self.head_dim_padded,), mdQaccu[head_idx, None])
+                # mdQaccu_cur = cute.domain_offset(((seqlen.offset_q + (self.m_block_size - 1) * batch_idx) * self.head_dim_padded,), mdQaccu[head_idx, None])
             head_idx_kv = head_idx # head_idx // self.qhead_per_kvhead if cutlass.const_expr(not self.pack_gqa) else head_idx
 
             if cutlass.const_expr(not seqlen.has_cu_seqlens_k):
@@ -686,6 +688,8 @@ class FlashAttentionBackwardSm80:
             # of tile_shape
             # ///////////////////////////////////////////////////////////////////////////////
             # Construct identity layout for KV
+            # cdQ = cute.make_identity_tensor(gdQaccum.shape)
+            # tdQcdQ = gmem_thr_copy_dQaccum.partition_S(cdQ)
             cQ = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
             tQcQ = gmem_thr_copy_QK.partition_S(cQ)
             t0QcQ = gmem_thr_copy_QK.get_slice(0).partition_S(cQ)
@@ -735,7 +739,9 @@ class FlashAttentionBackwardSm80:
                 tdQsdS=tdQsdS, tdQsKt=tdQsKt,
             )
             gmem_copy_params = SimpleNamespace(
-                gmem_thr_copy_dQaccum=gmem_thr_copy_dQaccum, tdQgdQaccum=tdQgdQaccum
+                gmem_thr_copy_dQaccum=gmem_thr_copy_dQaccum, 
+                tdQgdQaccum=tdQgdQaccum, 
+                # tdQcdQ=tdQcdQ,
             )
             load_Q_LSE = partial(
                 self.load_Q_LSE, gmem_tiled_copy_QK, gmem_tiled_copy_LSE,
@@ -753,6 +759,7 @@ class FlashAttentionBackwardSm80:
                 load_Q_LSE=load_Q_LSE, load_dO_dPsum=load_dO_dPsum,
                 m_block_max=m_block_max,
                 softmax_scale_log2=softmax_scale_log2,
+                # seqlen=seqlen.seqlen_q # TODO: Maybe move around?
             )
 
             # ///////////////////////////////////////////////////////////////////////////////
@@ -801,6 +808,7 @@ class FlashAttentionBackwardSm80:
             smem_pipe_write_q = cutlass.Int32(self.num_stages_Q - 1)
             smem_pipe_write_do = cutlass.Int32(0)
             for m_tile in cutlass.range(m_block_min, m_block_max, unroll=1):
+                # if cute.arch.block_idx()[0] == 1: 
                 compute_one_m_block(
                     m_tile, smem_pipe_read_q, smem_pipe_read_do, smem_pipe_write_q, smem_pipe_write_do,
                     mask_fn=mask_fn,
@@ -840,6 +848,7 @@ class FlashAttentionBackwardSm80:
         load_dO_dPsum: Callable,
         m_block_max: cutlass.Int32,
         softmax_scale_log2: cutlass.Float32,
+        # seqlen: cutlass.Int32,
         mask_fn: Optional[Callable] = None,
     ):
         def load_Q_next():
@@ -943,6 +952,8 @@ class FlashAttentionBackwardSm80:
             )
             acc_dQ = cute.make_fragment(acc_shape_dQ, cutlass.Float32)
             acc_dQ.fill(0.0)
+            # smem_copy_params.tdQsdS.fill(1.0)
+            # smem_copy_params.tdQsKt.fill(1.0)
             sm80_utils.gemm(
                 mma_params.thr_mma_dq, acc_dQ, mma_params.tdQrdS, mma_params.tdQrK,
                 smem_copy_params.tdQsdS, smem_copy_params.tdQsKt,
@@ -953,9 +964,11 @@ class FlashAttentionBackwardSm80:
             # ((1, 1), num_elements)
             acc_dQ_atomic = gmem_copy_params.gmem_thr_copy_dQaccum.retile(acc_dQ)
             tdQgdQaccum_atomic = gmem_copy_params.tdQgdQaccum[None, None, m_block]
+            # tdQcdQ_atomic = gmem_copy_params.tdQcdQ[None, None, m_block] # I think 0 should be fine here?
             assert cute.size(acc_dQ_atomic) == cute.size(tdQgdQaccum_atomic)
             # if cute.arch.thread_idx()[0] == 0: cute.print_tensor(acc_dQ)
             for i in cutlass.range(cute.size(acc_dQ_atomic), unroll_full=True):
+                # if tdQcdQ_atomic[i][0] < self.head_dim_padded * seqlen:
                 utils.atomic_add_fp32(acc_dQ_atomic[i], utils.elem_pointer(tdQgdQaccum_atomic, i))
                 # utils.atomic_add_fp32(acc_dQ[i], tdQgdQaccum_atomic.iterator + i * tdQgdQaccum_atomic.stride[1])
             # if cute.arch.thread_idx()[0] == 64 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dQ)

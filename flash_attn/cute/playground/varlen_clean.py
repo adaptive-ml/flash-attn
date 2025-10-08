@@ -16,6 +16,8 @@ def check_backward_vs_torch_flash(
     cu_seqlens_k=None, 
     seqused_q=None, 
     seqused_k=None, 
+    total_q=None, # Only need if varlen
+    total_k=None,
     softmax_scale=None, 
     causal=True,
     atol=3e-2, 
@@ -31,10 +33,24 @@ def check_backward_vs_torch_flash(
     q_fa, k_fa, v_fa = map(clone_like, (q, k, v))
     q_t,  k_t,  v_t  = map(clone_like, (q, k, v))
 
+    if cu_seqlens_q is not None:
+        cu_seqlens_q_fa = cu_seqlens_q.clone()
+        cu_seqlens_q_t = cu_seqlens_q.clone()
+    else:
+        cu_seqlens_q_fa = None
+        cu_seqlens_q_t = None
+
+    if cu_seqlens_k is not None:
+        cu_seqlens_k_fa = cu_seqlens_k.clone()
+        cu_seqlens_k_t = cu_seqlens_k.clone()
+    else:
+        cu_seqlens_k_fa = None
+        cu_seqlens_k_t = None
+
     out_fa, lse_fa = flash_attn_varlen_func(
         q_fa, k_fa, v_fa,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
+        cu_seqlens_q=cu_seqlens_q_fa,
+        cu_seqlens_k=cu_seqlens_k_fa,
         seqused_q=seqused_q,
         seqused_k=seqused_k,
         softmax_scale=(1.0 / q.shape[-1]**0.5) if softmax_scale is None else softmax_scale,
@@ -47,10 +63,12 @@ def check_backward_vs_torch_flash(
 
     out_t = torch_flash_ref(
         q_t, k_t, v_t, 
-        cu_seqlens_q=cu_seqlens_q, 
-        cu_seqlens_k=cu_seqlens_k, 
+        cu_seqlens_q=cu_seqlens_q_t, 
+        cu_seqlens_k=cu_seqlens_k_t, 
         seqused_q=seqused_q,
         seqused_k=seqused_k,
+        total_q=total_q,
+        total_k=total_k,
         softmax_scale=softmax_scale, 
         causal=causal
     )
@@ -72,6 +90,8 @@ def check_backward_vs_torch_flash(
     out_t.backward(grad_t, retain_graph=False)
     dq_t, dk_t, dv_t = q_t.grad, k_t.grad, v_t.grad
 
+    import pdb; pdb.set_trace()
+
     _stats("dQ", dq_fa, dq_t)
     _stats("dK", dk_fa, dk_t)
     _stats("dV", dv_fa, dv_t)
@@ -84,26 +104,29 @@ def check_backward_vs_torch_flash(
 
 # For testing full bwd pipeline
 if __name__ == "__main__":
-    # Some issue when seqlen gets large and/or small?
-    #    - len 2 to 8 --> fail for dq
-    #    - len 512 to 1024 --> fail for all
-    # Also even for batch size....
+    B = 20
+    H = 1
+    D = 128
 
-    B = 2
-    H = H_kv = 8
-    D = Dv = 128
-
-    q, k, v, cu_seqlens_q, cu_seqlens_k = generate_varlen_args(
+    q, k, v, cu_seqlens_q, cu_seqlens_k, total_q, total_k = generate_varlen_args(
         batch_size=B,
         n_heads=H,
         d_head=D,
-        min_len=32,
-        max_len=64,
+        min_len=2048,
+        max_len=4096,
         seqlen_q_eq_kv=True
     )
+
+    print(f"{cu_seqlens_k=}")
 
     softmax_scale = None
     causal = False
 
-    ok = check_backward_vs_torch_flash(q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale=softmax_scale, causal=causal)
+    ok = check_backward_vs_torch_flash(
+        q, k, v, 
+        cu_seqlens_q, cu_seqlens_k, 
+        total_q=total_q, total_k=total_k, 
+        softmax_scale=softmax_scale, 
+        causal=causal
+    )
     print("Backward match within tolerance:", ok)

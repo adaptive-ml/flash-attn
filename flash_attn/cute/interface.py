@@ -324,6 +324,7 @@ def _flash_attn_bwd(
         dpsum = torch.empty(batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device)
         lse_log2 = torch.empty(batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device)
     else:
+        # total_q_rounded = (total_q + (cu_seqlens_q.shape[0] - 1) * (m_block_size - 1)) // m_block_size * m_block_size
         total_q_rounded = (total_q + m_block_size - 1) // m_block_size * m_block_size
         dq_accum = torch.empty(num_head, total_q_rounded * head_dim_rounded, dtype=torch.float32, device=device)
         dpsum = torch.empty(num_head, total_q_rounded, dtype=torch.float32, device=device)
@@ -372,7 +373,6 @@ def _flash_attn_bwd(
         o_tensor, do_tensor, dpsum_tensor, lse_tensor, lse_log2_tensor, dq_accum_tensor, current_stream
     )
 
-    # Now need to support cuseqlen_q and k for bwd...
 
     # Backward kernel: compute dk, dv, dq_accum.
     compile_key = (
@@ -576,7 +576,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         assert seqused_q == seqused_k == None
         assert ctx.causal == False
         assert ctx.softcap == 0.0
-        # assert ctx.softmax_scale == None
         dq, dk, dv = _flash_attn_bwd(
             q,
             k,
@@ -589,8 +588,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.softcap,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
-            # seqused_q=seqused_q,
-            # seqused_k=seqused_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
         )
 
         return dq, dk, dv, *((None,) * 11)
