@@ -324,11 +324,12 @@ def _flash_attn_bwd(
         dpsum = torch.empty(batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device)
         lse_log2 = torch.empty(batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device)
     else:
-        # total_q_rounded = (total_q + (cu_seqlens_q.shape[0] - 1) * (m_block_size - 1)) // m_block_size * m_block_size
-        total_q_rounded = (total_q + m_block_size - 1) // m_block_size * m_block_size
-        dq_accum = torch.empty(num_head, total_q_rounded * head_dim_rounded, dtype=torch.float32, device=device)
-        dpsum = torch.empty(num_head, total_q_rounded, dtype=torch.float32, device=device)
-        lse_log2 = torch.empty(num_head, total_q_rounded, dtype=torch.float32, device=device)
+        # need the extra m_block_size - 1 for ceil_div
+        total_q_rounded_padded = (total_q + cu_seqlens_q.shape[0] * m_block_size - 1) // m_block_size * m_block_size
+        # total_q_rounded = (total_q + m_block_size - 1) // m_block_size * m_block_size
+        dq_accum = torch.empty(num_head, total_q_rounded_padded * head_dim_rounded, dtype=torch.float32, device=device)
+        dpsum = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
+        lse_log2 = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
 
     if qhead_per_kvhead > 1:
         assert cu_seqlens_k is None and cu_seqlens_q is None # Not supported for now
@@ -367,10 +368,10 @@ def _flash_attn_bwd(
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache_pre[compile_key_pre] = cute.compile(
             fa_bwd_pre, o_tensor, do_tensor, dpsum_tensor, lse_tensor, lse_log2_tensor,
-            dq_accum_tensor, current_stream
+            dq_accum_tensor, cu_seqlens_q_tensor, seqused_q_tensor, current_stream,
         )
     _flash_attn_bwd.compile_cache_pre[compile_key_pre](
-        o_tensor, do_tensor, dpsum_tensor, lse_tensor, lse_log2_tensor, dq_accum_tensor, current_stream
+        o_tensor, do_tensor, dpsum_tensor, lse_tensor, lse_log2_tensor, dq_accum_tensor, cu_seqlens_q_tensor, seqused_q_tensor, current_stream,
     )
 
 

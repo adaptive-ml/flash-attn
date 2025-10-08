@@ -104,16 +104,16 @@ def check_backward_vs_torch_flash(
 
 # For testing full bwd pipeline
 if __name__ == "__main__":
-    B = 20
+    B = 2
     H = 1
-    D = 128
+    D = 64
 
     q, k, v, cu_seqlens_q, cu_seqlens_k, total_q, total_k = generate_varlen_args(
         batch_size=B,
         n_heads=H,
         d_head=D,
-        min_len=2048,
-        max_len=4096,
+        min_len=16,
+        max_len=32,
         seqlen_q_eq_kv=True
     )
 
