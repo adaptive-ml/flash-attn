@@ -896,6 +896,10 @@ class FlashAttentionBackwardSm80:
         assert cute.size(acc_dP_mn, mode=[0]) == cute.size(tLSErdPsum)
         for r in cutlass.range(cute.size(acc_dP_mn, mode=[0]), unroll_full=True):
             acc_dP_mn[r, None].store(acc_S_mn[r, None].load() * (acc_dP_mn[r, None].load() - tLSErdPsum[r]))
+            # TODO: FIX
+            # if cutlass.const_expr(self.softcap != 0.0):
+            #     acc_dP_mn[r, None] *= cute.exp2f(acc_dP_mn[r, None] * params.softmax_scale_log2 - tLSErdPsum[r]) 
+                
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dP_mn)
         rP = cute.make_fragment_like(acc_S, self.dtype)
         rP.store(acc_S.load().to(self.dtype))

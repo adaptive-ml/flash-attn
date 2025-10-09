@@ -584,7 +584,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     def backward(ctx, dout, *args):
         q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
         assert seqused_q == seqused_k == None
-        assert ctx.softcap == 0.0
         dq, dk, dv = _flash_attn_bwd(
             q,
             k,

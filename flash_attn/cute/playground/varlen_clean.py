@@ -23,6 +23,7 @@ def check_backward_vs_torch_flash(
     causal=True,
     atol=3e-2, 
     rtol=3e-2,
+    softcap=0.0
 ):
     assert q.requires_grad and k.requires_grad and v.requires_grad, "Set requires_grad=True on inputs"
 
@@ -58,7 +59,7 @@ def check_backward_vs_torch_flash(
         causal=causal,
         window_size=(None, None),
         learnable_sink=None,
-        softcap=0.0,
+        softcap=softcap,
         pack_gqa=None,
     )
 
@@ -73,7 +74,7 @@ def check_backward_vs_torch_flash(
         softmax_scale=softmax_scale, 
         causal=causal,
         mha_type=mha_type,
-        softcap=0.0,
+        softcap=softcap,
         window=(-1, -1),
     )
 
@@ -125,6 +126,7 @@ if __name__ == "__main__":
     softmax_scale = None
     dtype = torch.bfloat16
     mha_type = 'mha'
+    softcap=2.0
     # Tests to look at...
     # B     H       D       min_len     max_len     causal      softmax_scale       dtype
     # 7     10      64      1           64          True        2.0                 bfloat16    <--- Look into... probably some to float error?
@@ -147,6 +149,7 @@ if __name__ == "__main__":
         cu_seqlens_k=cu_seqlens_k, 
         total_q=total_q, total_k=total_k, 
         softmax_scale=softmax_scale, 
-        causal=causal
+        causal=causal,
+        softcap=softcap,
     )
     print("Backward match within tolerance:", ok)

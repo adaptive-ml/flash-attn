@@ -1,3 +1,4 @@
+from functools import partial
 from typing import Optional
 import torch
 import torch.nn.functional as F
@@ -132,6 +133,10 @@ def _stats(name, a, b, atol, rtol):
     return mean_abs < atol and mean_rel < rtol
 
 
+def score_mod(sc, score, b, h, q_idx, kv_idx):
+    # score is the pre-softmax dot product (already scaled by `scale` inside flex)
+    # We apply a smooth cap: sc * tanh(score / sc)
+    return torch.tanh(score / sc) * sc
 
 
 
@@ -183,12 +188,9 @@ def flex_attn_wrapper(
 
     if softcap is not None:
         sc = float(softcap)
-        def score_mod(score, b, h, q_idx, kv_idx):
-            # score is the pre-softmax dot product (already scaled by `scale` inside flex)
-            # We apply a smooth cap: sc * tanh(score / sc)
-            return torch.tanh(score / sc) * sc
+        scoremod = partial(score_mod, sc)
     else:
-        score_mod = None
+        scoremod = None
 
     left, right = window
     use_window = not (left == -1 and right == -1)
@@ -214,7 +216,7 @@ def flex_attn_wrapper(
     out = flex_attention(
         q, k, v,
         block_mask=block_mask,
-        score_mod=score_mod,
+        score_mod=scoremod,
         scale=scale,
         enable_gqa=enable_gqa,
     )
