@@ -305,20 +305,61 @@ def _flash_attn_bwd(
     AtomLayoutNdKV: int = 2,
     AtomLayoutMdQ: int = 2,
     V_in_regs: bool = False,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    q, k, v, out, dout, lse = [maybe_contiguous(t) for t in (q, k, v, out, dout, lse)]
-    batch_size, seqlen_q, num_head, head_dim = q.shape
-    _, seqlen_k, num_head_kv, _ = k.shape
-    _, _, _, head_dim_v = v.shape
-    assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
-    assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
-    assert out.shape == (batch_size, seqlen_q, num_head, head_dim_v)
-    assert dout.shape == (batch_size, seqlen_q, num_head, head_dim_v)
-    assert lse.shape == (batch_size, num_head, seqlen_q), "lse must have shape (batch_size, num_head, seqlen_q)"
+    q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = [
+        maybe_contiguous(t) 
+        for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+    ]
+    num_head, head_dim = q.shape[-2:]
+    if cu_seqlens_q is None:
+        batch_size, seqlen_q = q.shape[:2]
+        total_q = batch_size * seqlen_q
+    else:
+        batch_size = cu_seqlens_q.shape[0] - 1
+        seqlen_q = None
+        total_q = q.shape[0]
+
+    if cu_seqlens_k is None:
+        batch_size, seqlen_k = k.shape[:2]
+        total_k = batch_size * seqlen_k
+    else:
+        batch_size = cu_seqlens_k.shape[0] - 1
+        seqlen_k = None
+        total_k = k.shape[0]
+
+    num_head_kv = k.shape[-2]
+    head_dim_v = v.shape[-1]
+
+    if cu_seqlens_k is None:
+        assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
+        assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
+    else:
+        assert k.shape == (total_k, num_head_kv, head_dim)
+        assert v.shape == (total_k, num_head_kv, head_dim_v)
+        assert cu_seqlens_k.shape == (batch_size + 1,), "cu_seqlens_k must have shape (batch_size + 1,)"
+
+    if cu_seqlens_q is not None: 
+        assert cu_seqlens_q.shape == (batch_size + 1,), "cu_seqlens_q must have shape (batch_size + 1,)"
+
+        assert out.shape == (total_q, num_head, head_dim_v)
+        assert dout.shape == (total_q, num_head, head_dim_v)
+        assert lse.shape == (num_head, total_q), "lse must have shape (num_head, total_q)"
+    else:
+        assert out.shape == (batch_size, seqlen_q, num_head, head_dim_v)
+        assert dout.shape == (batch_size, seqlen_q, num_head, head_dim_v)
+        assert lse.shape == (batch_size, num_head, seqlen_q), "lse must have shape (batch_size, num_head, seqlen_q)"
+
     assert q.dtype in [torch.float16, torch.bfloat16], "inputs must be float16 or bfloat16"
     assert q.dtype == k.dtype == v.dtype == out.dtype == dout.dtype, "inputs must have the same dtype"
+    for t in [cu_seqlens_q, cu_seqlens_k]:
+        if t is not None:
+            assert t.dtype == torch.int32, "cu_seqlens_q, cu_seqlens_k must be int32"
     assert lse.dtype == torch.float32, "lse must be float32"
-    assert all(t.is_cuda for t in (q, k, v, out, dout, lse)), "inputs must be on CUDA device"
+    assert all(t is None or t.is_cuda for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k)), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     assert head_dim <= 256, "head_dim must be less than or equal to 256"
     alignment = 16 // q.element_size()
@@ -330,35 +371,53 @@ def _flash_attn_bwd(
 
     device = q.device
     # TODO: check if this is the right rounding
-    seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
-    head_dim_rounded = (head_dim + 32 - 1) // 32 * 32
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
-    dq_accum = torch.empty(batch_size, num_head, seqlen_q_rounded * head_dim_rounded, dtype=torch.float32, device=device)
-    dpsum = torch.empty(batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device)
-    lse_log2 = torch.empty(batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device)
+
+    head_dim_rounded = (head_dim + 32 - 1) // 32 * 32
+
+    if cu_seqlens_q is None:
+        seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
+        dq_accum = torch.empty(batch_size, num_head, seqlen_q_rounded * head_dim_rounded, dtype=torch.float32, device=device)
+        dpsum = torch.empty(batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device)
+        lse_log2 = torch.empty(batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device)
+    else:
+        total_q_rounded_padded = (total_q + cu_seqlens_q.shape[0] * m_block_size - 1) // m_block_size * m_block_size
+        dq_accum = torch.empty(num_head, total_q_rounded_padded * head_dim_rounded, dtype=torch.float32, device=device)
+        dpsum = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
+        lse_log2 = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
+
     if qhead_per_kvhead > 1:
-        seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
         head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
-        dk_accum = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded * head_dim_rounded, dtype=torch.float32, device=device)
-        dv_accum = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded * head_dim_v_rounded, dtype=torch.float32, device=device)
+        if cu_seqlens_k is None:
+            seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
+            dk_accum = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded * head_dim_rounded, dtype=torch.float32, device=device)
+            dv_accum = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded * head_dim_v_rounded, dtype=torch.float32, device=device)
+        else:
+            total_k_rounded_padded = (total_k + cu_seqlens_k.shape[0] * n_block_size - 1) // n_block_size * n_block_size
+            dk_accum = torch.zeros(num_head_kv, total_k_rounded_padded * head_dim_rounded, dtype=torch.float32, device=device)
+            dv_accum = torch.zeros(num_head_kv, total_k_rounded_padded * head_dim_v_rounded, dtype=torch.float32, device=device)
 
     dtype = torch2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
         utils.convert_from_dlpack(t.detach(), leading_dim=t.ndim - 1, alignment=16, divisibility=8)
         for t in (q, k, v, out, dout, dq, dk, dv)
     ]
-    lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=2)
+    lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 1)
     dq_accum_tensor, dpsum_tensor, lse_log2_tensor = [
-        utils.convert_from_dlpack(t.detach(), leading_dim=2, alignment=16, divisibility=4)
+        utils.convert_from_dlpack(t.detach(), leading_dim=t.ndim - 1, alignment=16, divisibility=4)
         for t in (dq_accum, dpsum, lse_log2)
     ]
     if qhead_per_kvhead > 1:
         dk_accum_tensor, dv_accum_tensor = [
-            utils.convert_from_dlpack(t.detach(), leading_dim=2, alignment=16, divisibility=4)
+            utils.convert_from_dlpack(t.detach(), leading_dim=t.ndim - 1, alignment=16, divisibility=4)
             for t in (dk_accum, dv_accum)
         ]
+    cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor = [
+        from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0) if t is not None else None
+        for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+    ]
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1), lse * log2_e, and zero out dq_accum.
@@ -565,9 +624,25 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
-        raise NotImplementedError(
-            "Backward pass for FlashAttention with variable length sequences is not implemented yet."
+        assert seqused_q == seqused_k == None
+        assert ctx.softcap == 0.0
+        dq, dk, dv = _flash_attn_bwd(
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            ctx.softmax_scale,
+            ctx.causal,
+            ctx.softcap,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
         )
+
+        return dq, dk, dv, *((None,) * 11)
 
 
 def flash_attn_func(
