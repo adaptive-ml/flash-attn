@@ -374,7 +374,6 @@ def _flash_attn_bwd(
         o_tensor, do_tensor, dpsum_tensor, lse_tensor, lse_log2_tensor, dq_accum_tensor, cu_seqlens_q_tensor, seqused_q_tensor, current_stream,
     )
 
-
     # Backward kernel: compute dk, dv, dq_accum.
     compile_key = (
         dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap != 0.0, m_block_size,
@@ -436,10 +435,10 @@ def _flash_attn_bwd(
         )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
-            fa_bwd_post, dq_accum_tensor, dq_tensor, softmax_scale, current_stream
+            fa_bwd_post, dq_accum_tensor, dq_tensor, softmax_scale, cu_seqlens_q_tensor, seqused_q_tensor, current_stream
         )
     _flash_attn_bwd.compile_cache_post[compile_key_post](
-        dq_accum_tensor, dq_tensor, softmax_scale, current_stream
+        dq_accum_tensor, dq_tensor, softmax_scale, cu_seqlens_q_tensor, seqused_q_tensor, current_stream
     )
 
     if qhead_per_kvhead > 1:
