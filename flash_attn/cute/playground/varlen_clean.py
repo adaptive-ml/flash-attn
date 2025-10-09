@@ -6,6 +6,7 @@ from flash_attn.cute import flash_attn_varlen_func
 
 from flash_attn.cute.playground.varlen_ref import (
     torch_flash_ref, 
+    torch_flex_ref, 
     _stats, 
     generate_varlen_args,
 )
@@ -61,7 +62,7 @@ def check_backward_vs_torch_flash(
         pack_gqa=None,
     )
 
-    out_t = torch_flash_ref(
+    out_t = torch_flex_ref(
         q_t, k_t, v_t, 
         cu_seqlens_q=cu_seqlens_q_t, 
         cu_seqlens_k=cu_seqlens_k_t, 
@@ -70,7 +71,10 @@ def check_backward_vs_torch_flash(
         total_q=total_q,
         total_k=total_k,
         softmax_scale=softmax_scale, 
-        causal=causal
+        causal=causal,
+        mha_type=mha_type,
+        softcap=0.0,
+        window=(-1, -1),
     )
 
     # Use the same upstream gradient to compare backward paths
@@ -79,8 +83,8 @@ def check_backward_vs_torch_flash(
     grad_fa = clone_like(grad_out)
     grad_t = clone_like(grad_out)
 
-    _stats("dO", grad_fa, grad_t)
-    _stats("O", out_fa, out_t)
+    _stats("dO", grad_fa, grad_t, atol=atol, rtol=rtol)
+    _stats("O", out_fa, out_t, atol=atol, rtol=rtol)
 
     # Cute bwd
     out_fa.backward(grad_fa, retain_graph=False)
@@ -92,9 +96,9 @@ def check_backward_vs_torch_flash(
 
     import pdb; pdb.set_trace()
 
-    _stats("dQ", dq_fa, dq_t)
-    _stats("dK", dk_fa, dk_t)
-    _stats("dV", dv_fa, dv_t)
+    _stats("dQ", dq_fa, dq_t, atol=atol, rtol=rtol)
+    _stats("dK", dk_fa, dk_t, atol=atol, rtol=rtol)
+    _stats("dV", dv_fa, dv_t, atol=atol, rtol=rtol)
 
     ok_q = torch.allclose(dq_fa.float(), dq_t.float(), atol=atol, rtol=rtol)
     ok_k = torch.allclose(dk_fa.float(), dk_t.float(), atol=atol, rtol=rtol)
@@ -104,14 +108,23 @@ def check_backward_vs_torch_flash(
 
 # For testing full bwd pipeline
 if __name__ == "__main__":
-    B = 5
-    H = 7
-    D = 64
-    min_len = 256
-    max_len = 1024
-    causal=True
-    softmax_scale=None
-    mha_type="mqa"
+    # B = 5
+    # H = 7
+    # D = 64
+    # min_len = 256
+    # max_len = 1024
+    # causal=True
+    # softmax_scale=None
+    # mha_type="gqa"
+    B = 1
+    H = 1
+    D = 128
+    min_len = 128
+    max_len = 128
+    causal = False
+    softmax_scale = None
+    dtype = torch.bfloat16
+    mha_type = 'mha'
     # Tests to look at...
     # B     H       D       min_len     max_len     causal      softmax_scale       dtype
     # 7     10      64      1           64          True        2.0                 bfloat16    <--- Look into... probably some to float error?
