@@ -81,6 +81,8 @@ from flash_attn.cute.playground.varlen_ref import (
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("softmax_scale", [None, 1.0, 2.0])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("mha_type", ["mha"])
 # @pytest.mark.parametrize("softcap", [0.0, 15.0])
 def test_varlen(
     B,
@@ -91,13 +93,12 @@ def test_varlen(
     causal,
     softmax_scale,
     dtype,
+    mha_type,
     # softcap,
     # local,
     # deterministic,
     # has_qv,
     # has_learnable_sink,
-    # mha_type: ,
-    # dtype: torch.NumberType = torch.bfloat16,
 ):
     sum_seqlen = ((min_seq_len + max_seq_len + 1) // 2) * B * H
     if min_seq_len > max_seq_len:
@@ -118,6 +119,7 @@ def test_varlen(
         d_head=D,
         min_len=min_seq_len,
         max_len=max_seq_len,
+        mha_type=mha_type,
         seqlen_q_eq_kv=True,
         dtype=dtype
     )

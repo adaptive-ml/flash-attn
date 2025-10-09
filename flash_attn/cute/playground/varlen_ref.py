@@ -70,7 +70,6 @@ def torch_flash_ref(
     # Asserts to maybe remove at some point (as we add features)
     assert seqused_q is None
     assert seqused_k is None
-    assert H == H_kv
     assert d == d_v
 
     hcseq_q = cu_seqlens_q.to(device='cpu')
@@ -132,6 +131,7 @@ def generate_varlen_args(
     d_head=128,
     min_len=32,
     max_len=64,
+    mha_type="mha",
     seqlen_q_eq_kv=True,
     dtype = torch.bfloat16,
 ): # Need Q, K, V, dO, dPsum, lse_log2, dq_accum, dK, dV, softmax_scale, cu_seqlen_q, cu_seqlen_k
@@ -140,6 +140,8 @@ def generate_varlen_args(
     device = "cuda"
 
     assert seqlen_q_eq_kv # For now...
+
+    assert mha_type in ["mha", "mqa", "gqa"]
 
     lens_q = torch.randint(low=min_len, high=max_len + 1, size=(batch_size,))
     if seqlen_q_eq_kv:
@@ -157,7 +159,15 @@ def generate_varlen_args(
     cu_seqlens_q = cu_seqlens_q.contiguous().to(dtype=torch.int32, device=device)
     cu_seqlens_k = cu_seqlens_k.contiguous().to(dtype=torch.int32, device=device)
 
-    H = H_kv = n_heads
+    if mha_type == "gqa":
+        H = 3 * n_heads
+        H_kv = n_heads
+    elif mha_type == "mha":
+        H = H_kv = n_heads
+    else: # MQA
+        H = n_heads
+        H_kv = 1
+
     d_head_v = d_head
 
     q = torch.randn(total_q, H, d_head, device=device, dtype=dtype, requires_grad=True)

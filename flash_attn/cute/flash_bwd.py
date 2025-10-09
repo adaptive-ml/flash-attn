@@ -1025,6 +1025,9 @@ class FlashAttentionBackwardSm80:
         gmem_thr_copy_dK = gmem_tiled_copy_dK.get_slice(tidx)
         gmem_thr_copy_dV = gmem_tiled_copy_dV.get_slice(tidx)
 
+        batch_idx = batch_size
+        head_idx_kv = num_head // self.qhead_per_kvhead # if cutlass.const_expr(not self.pack_gqa) else num_head
+
         if cutlass.const_expr(self.qhead_per_kvhead == 1):
             # Make sure all threads have finished reading K and V, otherwise we get racy dQ
             # because smem_q could be changed.
@@ -1042,8 +1045,6 @@ class FlashAttentionBackwardSm80:
             cute.copy(smem_copy_atom_dKV, taccdVrdV, taccdVsdV)
             cute.copy(smem_copy_atom_dKV, taccdKrdK, taccdKsdK)
 
-            batch_idx = batch_size
-            head_idx_kv = num_head # head_idx # head_idx // self.qhead_per_kvhead if cutlass.const_expr(not self.pack_gqa) else head_idx
 
             if cutlass.const_expr(not seqlen.has_cu_seqlens_k):
                 mdK_cur, mdV_cur = [t[batch_idx, None, head_idx_kv, None] for t in (mdK, mdV)]
@@ -1112,7 +1113,9 @@ class FlashAttentionBackwardSm80:
             if cutlass.const_expr(not seqlen.has_cu_seqlens_k):
                 mdK_cur, mdV_cur = [t[batch_idx, head_idx_kv, None] for t in (mdK, mdV)]
             else:
-                mdK_cur, mdV_cur = [cute.domain_offset((seqlen.offset_k, 0), t[head_idx_kv, None]) for t in (mdK, mdV)]
+                padded_offset_k = seqlen.offset_k + batch_idx * self.n_block_size
+                mdK_cur = cute.domain_offset((padded_offset_k * self.head_dim_padded,), mdK[head_idx_kv, None])
+                mdV_cur = cute.domain_offset((padded_offset_k * self.head_dim_v_padded,), mdV[head_idx_kv, None])
 
             gdV = cute.local_tile(mdV_cur, (self.n_block_size * self.head_dim_v_padded,), (n_block,))
             gdK = cute.local_tile(mdK_cur, (self.n_block_size * self.head_dim_padded,), (n_block,))

@@ -104,13 +104,14 @@ def check_backward_vs_torch_flash(
 
 # For testing full bwd pipeline
 if __name__ == "__main__":
-    B = 7
-    H = 10
+    B = 5
+    H = 7
     D = 64
-    min_len = 1
-    max_len = 64
+    min_len = 256
+    max_len = 1024
     causal=True
-    softmax_scale=2.0
+    softmax_scale=None
+    mha_type="mqa"
     # Tests to look at...
     # B     H       D       min_len     max_len     causal      softmax_scale       dtype
     # 7     10      64      1           64          True        2.0                 bfloat16    <--- Look into... probably some to float error?
@@ -121,6 +122,7 @@ if __name__ == "__main__":
         d_head=D,
         min_len=min_len,
         max_len=max_len,
+        mha_type=mha_type,
         seqlen_q_eq_kv=True
     )
 
@@ -128,7 +130,8 @@ if __name__ == "__main__":
 
     ok = check_backward_vs_torch_flash(
         q, k, v, 
-        cu_seqlens_q, cu_seqlens_k, 
+        cu_seqlens_q=cu_seqlens_q, 
+        cu_seqlens_k=cu_seqlens_k, 
         total_q=total_q, total_k=total_k, 
         softmax_scale=softmax_scale, 
         causal=causal

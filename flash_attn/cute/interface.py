@@ -270,7 +270,14 @@ def _flash_attn_bwd(
         seqlen_q = None
         total_q = q.shape[0]
 
-    seqlen_k = k.shape[-3]
+    if cu_seqlens_k is None:
+        batch_size, seqlen_k = k.shape[:2]
+        total_k = batch_size * seqlen_k
+    else:
+        batch_size = cu_seqlens_k.shape[0] - 1
+        seqlen_k = None
+        total_k = k.shape[0]
+
     num_head_kv = k.shape[-2]
     head_dim_v = v.shape[-1]
 
@@ -278,8 +285,8 @@ def _flash_attn_bwd(
         assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
         assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
     else:
-        assert k.shape == (seqlen_k, num_head_kv, head_dim)
-        assert v.shape == (seqlen_k, num_head_kv, head_dim_v)
+        assert k.shape == (total_k, num_head_kv, head_dim)
+        assert v.shape == (total_k, num_head_kv, head_dim_v)
         assert cu_seqlens_k.shape == (batch_size + 1,), "cu_seqlens_k must have shape (batch_size + 1,)"
 
     if cu_seqlens_q is not None: 
@@ -326,17 +333,20 @@ def _flash_attn_bwd(
     else:
         # need the extra m_block_size - 1 for ceil_div
         total_q_rounded_padded = (total_q + cu_seqlens_q.shape[0] * m_block_size - 1) // m_block_size * m_block_size
-        # total_q_rounded = (total_q + m_block_size - 1) // m_block_size * m_block_size
         dq_accum = torch.empty(num_head, total_q_rounded_padded * head_dim_rounded, dtype=torch.float32, device=device)
         dpsum = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
         lse_log2 = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
 
     if qhead_per_kvhead > 1:
-        assert cu_seqlens_k is None and cu_seqlens_q is None # Not supported for now
-        seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
         head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
-        dk_accum = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded * head_dim_rounded, dtype=torch.float32, device=device)
-        dv_accum = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded * head_dim_v_rounded, dtype=torch.float32, device=device)
+        if cu_seqlens_k is None:
+            seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
+            dk_accum = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded * head_dim_rounded, dtype=torch.float32, device=device)
+            dv_accum = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded * head_dim_v_rounded, dtype=torch.float32, device=device)
+        else:
+            total_k_rounded_padded = (total_k + cu_seqlens_k.shape[0] * n_block_size - 1) // n_block_size * n_block_size
+            dk_accum = torch.zeros(num_head_kv, total_k_rounded_padded * head_dim_rounded, dtype=torch.float32, device=device)
+            dv_accum = torch.zeros(num_head_kv, total_k_rounded_padded * head_dim_v_rounded, dtype=torch.float32, device=device)
 
     dtype = torch2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
@@ -450,10 +460,10 @@ def _flash_attn_bwd(
             )
             # TODO: check @can_implement
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
-                fa_bwd_post, dk_accum_tensor, dk_tensor, softmax_scale, current_stream
+                fa_bwd_post, dk_accum_tensor, dk_tensor, softmax_scale, cu_seqlens_k_tensor, seqused_k_tensor, current_stream
             )
         _flash_attn_bwd.compile_cache_post[compile_key_post](
-            dk_accum_tensor, dk_tensor, softmax_scale, current_stream
+            dk_accum_tensor, dk_tensor, softmax_scale, cu_seqlens_k_tensor, seqused_k_tensor, current_stream
         )
         compile_key_post = (dtype, head_dim_v, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB)
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
@@ -462,10 +472,10 @@ def _flash_attn_bwd(
             )
             # TODO: check @can_implement
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
-                fa_bwd_post, dv_accum_tensor, dv_tensor, cutlass.Float32(1.0), current_stream
+                fa_bwd_post, dv_accum_tensor, dv_tensor, cutlass.Float32(1.0), cu_seqlens_k_tensor, seqused_k_tensor, current_stream
             )
         _flash_attn_bwd.compile_cache_post[compile_key_post](
-            dv_accum_tensor, dv_tensor, cutlass.Float32(1.0), current_stream
+            dv_accum_tensor, dv_tensor, cutlass.Float32(1.0), cu_seqlens_k_tensor, seqused_k_tensor, current_stream
         )
 
     return dq, dk, dv
