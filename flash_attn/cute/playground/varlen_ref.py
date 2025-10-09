@@ -70,8 +70,6 @@ def torch_flash_ref(
     # Asserts to maybe remove at some point (as we add features)
     assert seqused_q is None
     assert seqused_k is None
-    assert softmax_scale is None
-    assert causal == False
     assert H == H_kv
     assert d == d_v
 
@@ -135,16 +133,13 @@ def generate_varlen_args(
     min_len=32,
     max_len=64,
     seqlen_q_eq_kv=True,
-    softmax_scale=1.0 # TODO: Test changing this at some point
+    dtype = torch.bfloat16,
 ): # Need Q, K, V, dO, dPsum, lse_log2, dq_accum, dK, dV, softmax_scale, cu_seqlen_q, cu_seqlen_k
 
     torch.manual_seed(0)
     device = "cuda"
-    dtype = torch.bfloat16
 
     assert seqlen_q_eq_kv # For now...
-
-    # Figure out which parts of the kernel/computations need to be changed with cuseqlens
 
     lens_q = torch.randint(low=min_len, high=max_len + 1, size=(batch_size,))
     if seqlen_q_eq_kv:
@@ -162,28 +157,10 @@ def generate_varlen_args(
     cu_seqlens_q = cu_seqlens_q.contiguous().to(dtype=torch.int32, device=device)
     cu_seqlens_k = cu_seqlens_k.contiguous().to(dtype=torch.int32, device=device)
 
-    # Now cu_seqlens_q and cu_seqlens_k exist
-
     H = H_kv = n_heads
     d_head_v = d_head
 
     q = torch.randn(total_q, H, d_head, device=device, dtype=dtype, requires_grad=True)
-    # hk = torch.zeros(total_k, H_kv, d_head, dtype=dtype)
-    # start0 = hcseqk[0].item()
-    # end0   = hcseqk[1].item()
-    # start1 = hcseqk[1].item()
-    # end1   = hcseqk[2].item()
-
-    # # hk[start0:end0] = 1
-    # # hk[start1:end1] = 2
-    # ramp = 0.1 * torch.arange(d_head, dtype=hk.dtype)
-
-    # # expand to match (seq_len, H_kv, d_head)
-    # hk[start0:end0] = ramp
-    # hk[start1:end1] = 2 * ramp
-
-    # k = hk.to(device=device).requires_grad_()
-    
     k = torch.randn(total_k, H_kv, d_head, device=device, dtype=dtype, requires_grad=True)
     v = torch.randn(total_k, H_kv, d_head_v, device=device, dtype=dtype, requires_grad=True)
 

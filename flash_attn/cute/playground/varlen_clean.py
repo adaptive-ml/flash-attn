@@ -104,23 +104,27 @@ def check_backward_vs_torch_flash(
 
 # For testing full bwd pipeline
 if __name__ == "__main__":
-    B = 5
-    H = 8
+    B = 7
+    H = 10
     D = 64
+    min_len = 1
+    max_len = 64
+    causal=True
+    softmax_scale=2.0
+    # Tests to look at...
+    # B     H       D       min_len     max_len     causal      softmax_scale       dtype
+    # 7     10      64      1           64          True        2.0                 bfloat16    <--- Look into... probably some to float error?
 
     q, k, v, cu_seqlens_q, cu_seqlens_k, total_q, total_k = generate_varlen_args(
         batch_size=B,
         n_heads=H,
         d_head=D,
-        min_len=1024,
-        max_len=2048,
+        min_len=min_len,
+        max_len=max_len,
         seqlen_q_eq_kv=True
     )
 
     print(f"{cu_seqlens_k=}")
-
-    softmax_scale = None
-    causal = False
 
     ok = check_backward_vs_torch_flash(
         q, k, v, 
