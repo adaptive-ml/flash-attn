@@ -421,6 +421,7 @@ def _flash_attn_bwd(
     m_block_size: int = 64,
     n_block_size: int = 128,
     num_threads: int = 256,
+    pack_gqa: bool = False,
     num_stages_Q: int = 2,
     num_stages_dO: int = 2,
     SdP_swapAB: bool = False,
@@ -503,6 +504,8 @@ def _flash_attn_bwd(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     qhead_per_kvhead = num_head // num_head_kv
+    if pack_gqa is None:
+        pack_gqa = qhead_per_kvhead > 1
 
     device = q.device
     # TODO: check if this is the right rounding
@@ -617,6 +620,8 @@ def _flash_attn_bwd(
             lse_tensor,
             lse_log2_tensor,
             dq_accum_tensor,
+            cu_seqlens_q_tensor,
+            seqused_q_tensor,
             current_stream,
         )
     _flash_attn_bwd.compile_cache_pre[compile_key_pre](
@@ -626,6 +631,8 @@ def _flash_attn_bwd(
         lse_tensor,
         lse_log2_tensor,
         dq_accum_tensor,
+        cu_seqlens_q_tensor,
+        seqused_q_tensor,
         current_stream,
     )
 
@@ -640,6 +647,7 @@ def _flash_attn_bwd(
         m_block_size,
         n_block_size,
         num_threads,
+        pack_gqa,
         num_stages_Q,
         num_stages_dO,
         SdP_swapAB,
@@ -663,6 +671,7 @@ def _flash_attn_bwd(
             num_stages_Q,
             num_stages_dO,
             num_threads,
+            pack_gqa,
             causal,
             SdP_swapAB,
             dKV_swapAB,
@@ -707,6 +716,10 @@ def _flash_attn_bwd(
             dv_tensor if qhead_per_kvhead == 1 else dv_accum_tensor,
             softmax_scale,
             current_stream,
+            cu_seqlens_q_tensor,
+            cu_seqlens_k_tensor,
+            seqused_q_tensor,
+            seqused_k_tensor,
         )
     _flash_attn_bwd.compile_cache[compile_key](
         q_tensor,
@@ -720,6 +733,10 @@ def _flash_attn_bwd(
         dv_tensor if qhead_per_kvhead == 1 else dv_accum_tensor,
         softmax_scale,
         current_stream,
+        cu_seqlens_q_tensor,
+        cu_seqlens_k_tensor,
+        seqused_q_tensor,
+        seqused_k_tensor,
     )
 
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
@@ -731,10 +748,21 @@ def _flash_attn_bwd(
         )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
-            fa_bwd_post, dq_accum_tensor, dq_tensor, softmax_scale, current_stream
+            fa_bwd_post,
+            dq_accum_tensor,
+            dq_tensor,
+            softmax_scale,
+            cu_seqlens_q_tensor,
+            seqused_q_tensor,
+            current_stream,
         )
     _flash_attn_bwd.compile_cache_post[compile_key_post](
-        dq_accum_tensor, dq_tensor, softmax_scale, current_stream
+        dq_accum_tensor,
+        dq_tensor,
+        softmax_scale,
+        cu_seqlens_q_tensor,
+        seqused_q_tensor,
+        current_stream,
     )
 
     if qhead_per_kvhead > 1:
@@ -746,10 +774,21 @@ def _flash_attn_bwd(
             )
             # TODO: check @can_implement
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
-                fa_bwd_post, dk_accum_tensor, dk_tensor, softmax_scale, current_stream
+                fa_bwd_post,
+                dk_accum_tensor,
+                dk_tensor,
+                softmax_scale,
+                cu_seqlens_k_tensor,
+                seqused_k_tensor,
+                current_stream,
             )
         _flash_attn_bwd.compile_cache_post[compile_key_post](
-            dk_accum_tensor, dk_tensor, softmax_scale, current_stream
+            dk_accum_tensor,
+            dk_tensor,
+            softmax_scale,
+            cu_seqlens_k_tensor,
+            seqused_k_tensor,
+            current_stream,
         )
         compile_key_post = (
             dtype,
@@ -765,10 +804,21 @@ def _flash_attn_bwd(
             )
             # TODO: check @can_implement
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
-                fa_bwd_post, dv_accum_tensor, dv_tensor, cutlass.Float32(1.0), current_stream
+                fa_bwd_post,
+                dv_accum_tensor,
+                dv_tensor,
+                cutlass.Float32(1.0),
+                cu_seqlens_k_tensor,
+                seqused_k_tensor,
+                current_stream,
             )
         _flash_attn_bwd.compile_cache_post[compile_key_post](
-            dv_accum_tensor, dv_tensor, cutlass.Float32(1.0), current_stream
+            dv_accum_tensor,
+            dv_tensor,
+            cutlass.Float32(1.0),
+            cu_seqlens_k_tensor,
+            seqused_k_tensor,
+            current_stream,
         )
 
     return dq, dk, dv
