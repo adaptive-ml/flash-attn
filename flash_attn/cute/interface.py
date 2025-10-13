@@ -491,8 +491,8 @@ def _flash_attn_bwd(
         )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
-            # fa_bwd_sm80,
-            fa_bwd_sm90,
+            fa_bwd_sm80,
+            # fa_bwd_sm90,
             q_tensor, k_tensor, v_tensor, do_tensor, lse_log2_tensor, dpsum_tensor,
             dq_accum_tensor,
             dk_tensor if qhead_per_kvhead == 1 else dk_accum_tensor,
@@ -520,8 +520,8 @@ def _flash_attn_bwd(
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
     compile_key_post = (dtype, head_dim, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB)
     if compile_key_post not in _flash_attn_bwd.compile_cache_post:
-        # fa_bwd_post = FlashAttentionBackwardPostprocess(
-        fa_bwd_post = FlashAttentionBackwardPostprocess_sm90(
+        fa_bwd_post = FlashAttentionBackwardPostprocess(
+        # fa_bwd_post = FlashAttentionBackwardPostprocess_sm90(
             dtype, head_dim, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB
         )
         # TODO: check @can_implement
