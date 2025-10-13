@@ -438,14 +438,22 @@ class FlashAttentionBackwardPostprocess_sm90(FlashAttentionBackwardPostprocess):
         mdQaccum: cute.Tensor,
         mdQ: cute.Tensor,
         scale: cutlass.Float32,
+        mCuSeqlensQ: Optional[cute.Tensor],
+        mSequsedQ: Optional[cute.Tensor],
         stream: cuda.CUstream,
     ):
         # Assume all strides are divisible by 128 bits except the last stride
-        new_stride = lambda t: (*(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]), t.stride[-1])
-        mdQaccum, mdQ = [cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) for t in (mdQaccum, mdQ)]
+        new_stride = lambda t: (
+            *(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]),
+            t.stride[-1],
+        )
+        mdQaccum, mdQ = [
+            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
+            for t in (mdQaccum, mdQ)
+        ]
 
-        mdQ =      cute.make_tensor(mdQ.iterator, cute.select(mdQ.layout, mode=[1,3,2,0]))
-        mdQaccum = cute.make_tensor(mdQaccum.iterator, cute.select(mdQaccum.layout, mode=[2,1,0]))
+        mdQ = cute.make_tensor(mdQ.iterator, cute.select(mdQ.layout, mode=[1, 3, 2, 0]))
+        mdQaccum = cute.make_tensor(mdQaccum.iterator, cute.select(mdQaccum.layout, mode=[2, 1, 0]))
 
         # tiled_mma
         tiled_mma = sm90_utils_basic.make_trivial_tiled_mma(
@@ -455,7 +463,7 @@ class FlashAttentionBackwardPostprocess_sm90(FlashAttentionBackwardPostprocess):
             warpgroup.OperandMajorMode.MN,
             cutlass.Float32,
             atom_layout_mnk=(self.m_block_size // 64, 2, 1),
-            tiler_mn=(64, self.head_dim_padded)
+            tiler_mn=(64, self.head_dim_padded),
         )
 
         self.tiled_mma = tiled_mma
