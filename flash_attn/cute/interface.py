@@ -312,6 +312,7 @@ def _flash_attn_bwd(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None, # k, v, dk, dv
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = [
         maybe_contiguous(t) 
@@ -334,12 +335,28 @@ def _flash_attn_bwd(
         seqlen_k = None
         total_k = k.shape[0]
 
+    # TODO: Maybe make this cleaner
+    if page_table is not None:
+        assert cu_seqlens_k is None, "page_table is not supported with cu_seqlens_k"
+        assert page_table.dtype == torch.int32, "page_table must be int32"
+        assert page_table.stride(-1) == 1, "page_table must be contiguous in the last dimension"
+        max_num_pages_per_seq = page_table.shape[1]
+        assert page_table.shape == (batch_size, max_num_pages_per_seq)
+        num_pages, page_size = k.shape[:2]
+        seqlen_k = total_k = num_pages * page_size
+    else:
+        num_pages, page_size = None, None
+
     num_head_kv = k.shape[-2]
     head_dim_v = v.shape[-1]
 
     if cu_seqlens_k is None:
-        assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
-        assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
+        if page_table is None:
+            assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
+            assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
+        else:
+            assert k.shape == (num_pages, page_size, num_head_kv, head_dim)
+            assert v.shape == (num_pages, page_size, num_head_kv, head_dim_v)
     else:
         assert k.shape == (total_k, num_head_kv, head_dim)
         assert v.shape == (total_k, num_head_kv, head_dim_v)
@@ -347,7 +364,6 @@ def _flash_attn_bwd(
 
     if cu_seqlens_q is not None: 
         assert cu_seqlens_q.shape == (batch_size + 1,), "cu_seqlens_q must have shape (batch_size + 1,)"
-
         assert out.shape == (total_q, num_head, head_dim_v)
         assert dout.shape == (total_q, num_head, head_dim_v)
         assert lse.shape == (num_head, total_q), "lse must have shape (num_head, total_q)"
@@ -362,7 +378,7 @@ def _flash_attn_bwd(
         if t is not None:
             assert t.dtype == torch.int32, "cu_seqlens_q, cu_seqlens_k must be int32"
     assert lse.dtype == torch.float32, "lse must be float32"
-    assert all(t is None or t.is_cuda for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k)), "inputs must be on CUDA device"
+    assert all(t is None or t.is_cuda for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table)), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     assert head_dim <= 256, "head_dim must be less than or equal to 256"
     alignment = 16 // q.element_size()
@@ -423,6 +439,7 @@ def _flash_attn_bwd(
         from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=t.ndim-1) if t is not None else None
         for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
     ]
+    page_table_tensor = from_dlpack(page_table.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=1) if page_table is not None else None
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1), lse * log2_e, and zero out dq_accum.
@@ -445,7 +462,7 @@ def _flash_attn_bwd(
     compile_key = (
         dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap != 0.0, m_block_size,
         n_block_size, num_threads, pack_gqa, num_stages_Q, num_stages_dO, SdP_swapAB, dKV_swapAB, dQ_swapAB,
-        AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs
+        AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs, page_table is None
     )
     m_block_size = 64
     n_block_size = 128
@@ -503,6 +520,7 @@ def _flash_attn_bwd(
             cu_seqlens_k_tensor,
             seqused_q_tensor,
             seqused_k_tensor,
+            page_table_tensor,
         )
     _flash_attn_bwd.compile_cache[compile_key](
         q_tensor, k_tensor, v_tensor, do_tensor, lse_log2_tensor, dpsum_tensor,
@@ -515,6 +533,7 @@ def _flash_attn_bwd(
         cu_seqlens_k_tensor,
         seqused_q_tensor,
         seqused_k_tensor,
+        page_table_tensor,
     )
 
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
@@ -656,7 +675,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             softcap=softcap,
             pack_gqa=pack_gqa,
         )
-        ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+        ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -665,8 +684,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
-        assert seqused_q == seqused_k == None
+        q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table = ctx.saved_tensors
+        # assert seqused_q == seqused_k == None
         assert ctx.softcap == 0.0
         dq, dk, dv = _flash_attn_bwd(
             q,

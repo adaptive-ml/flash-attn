@@ -148,6 +148,7 @@ class FlashAttentionBackwardSm80:
         mCuSeqlensK_type: Type[cutlass.Numeric] | None,
         mSeqUsedQ_type: Type[cutlass.Numeric] | None,
         mSeqUsedK_type: Type[cutlass.Numeric] | None,
+        mPageTable_type: Type[cutlass.Numeric] | None,
     ):
         if cutlass.const_expr(not (mQ_type == mK_type == mV_type == mdO_type)):
             raise TypeError("All tensors must have the same data type")
@@ -173,6 +174,8 @@ class FlashAttentionBackwardSm80:
             raise TypeError("SeqUsedQ tensor must be Int32")
         if cutlass.const_expr(mSeqUsedK_type not in [None, cutlass.Int32]):
             raise TypeError("SeqUsedK tensor must be Int32")
+        if cutlass.const_expr(mPageTable_type not in [None, cutlass.Int32]):
+            raise TypeError("PageTable tensor must be Int32")
         assert mQ_type == self.dtype
 
     def _setup_attributes(self):
@@ -373,10 +376,11 @@ class FlashAttentionBackwardSm80:
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
+        mPageTable: Optional[cute.Tensor] = None,
     ):
         # Get the data type and check if it is fp16 or bf16
         self._check_type(*(t.element_type if t is not None else None
-                           for t in (mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)))
+                           for t in (mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK, mPageTable)))
         # Assume all strides are divisible by 128 bits except the last stride
         new_stride = lambda t: (*(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]), t.stride[-1])
         mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV = [cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) if t is not None else None for t in (mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV)]
@@ -427,6 +431,7 @@ class FlashAttentionBackwardSm80:
             mCuSeqlensK,
             mSeqUsedQ,
             mSeqUsedK,
+            mPageTable,
             softmax_scale,
             softmax_scale_log2,
             self.sQ_layout,
@@ -471,6 +476,7 @@ class FlashAttentionBackwardSm80:
         mCuSeqlensK: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
+        mPageTable: Optional[cute.Tensor],
         softmax_scale: cutlass.Float32,
         softmax_scale_log2: cutlass.Float32,
         sQ_layout: cute.ComposedLayout,
