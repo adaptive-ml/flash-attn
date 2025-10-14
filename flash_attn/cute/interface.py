@@ -232,7 +232,7 @@ def _flash_attn_fwd(
 
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
-            assert page_table is None, "paged KV not supported on SM 9.0"
+            assert page_size in [None, n_block_size], f"Only page_size={n_block_size} is supported for paged KV on SM 9.0"
             # fa_fwd = FlashAttentionForwardSm80(
             fa_fwd = FlashAttentionForwardSm90(
                 dtype,

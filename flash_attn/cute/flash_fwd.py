@@ -1235,7 +1235,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             cute.ceil_div(cute.size(mQ.shape[0]), self.tile_m),
             cute.size(mQ.shape[2]),
             cute.size(mQ.shape[3]) if const_expr(mCuSeqlensQ is None) else cute.size(mCuSeqlensQ.shape[0] - 1),
-            cute.size(mK.shape[0]),
+            cute.size(mK.shape[0]) if const_expr(mPageTable is None) else mK.shape[0] * mPageTable.shape[1],
             mQ.shape[1],
             mV.shape[1],
             total_q=cute.size(mQ.shape[0]) if const_expr(mCuSeqlensQ is not None) else cute.size(mQ.shape[0]) * cute.size(mQ.shape[3]),
@@ -1282,6 +1282,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mCuSeqlensK,
             mSeqUsedQ,
             mSeqUsedK,
+            mPageTable,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
@@ -1328,6 +1329,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mCuSeqlensK: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
+        mPageTable: Optional[cute.Tensor],
         tma_atom_Q: Optional[cute.CopyAtom],
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
@@ -1418,8 +1420,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
         SeqlenInfoCls = partial(
-            SeqlenInfoQK, seqlen_q_static=mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1],
-            seqlen_k_static=mK.shape[0],
+            SeqlenInfoQK, 
+            seqlen_q_static=mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1],
+            seqlen_k_static=cute.size(mK.shape[0]) if const_expr(mPageTable is None) else mK.shape[0] * mPageTable.shape[1],
             mCuSeqlensQ=mCuSeqlensQ, mCuSeqlensK=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedQ, mSeqUsedK=mSeqUsedK,
         )
@@ -1430,6 +1433,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
 
+
         if warp_idx < 4:  # Producer
             cute.arch.warpgroup_reg_dealloc(self.num_producer_regs)
             self.load(
@@ -1439,6 +1443,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 sQ,
                 sK,
                 sV,
+                mPageTable,
                 tma_atom_Q,
                 tma_atom_K,
                 tma_atom_V,
@@ -1496,6 +1501,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
+        mPageTable: Optional[cute.Tensor],
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
@@ -1520,10 +1526,24 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 seqlen = SeqlenInfoCls(batch_idx)
                 mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
                 head_idx_kv = head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
-                mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
-                mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
-                gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (None, 0))
-                gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
+                if const_expr(mPageTable is None):
+                    if const_expr(not seqlen.has_cu_seqlens_k):
+                        mK_cur, mV_cur = [t[None, None, head_idx_kv, batch_idx] for t in (mK, mV)]
+                    else:
+                        mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, head_idx_kv])
+                        mV_cur = cute.domain_offset((seqlen.offset_k, 0), mV[None, None, head_idx_kv])
+                    gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (None, 0))
+                    gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
+                else:
+                    # mK = (page_size, d, h_k, num_pages)
+                    # mK_cur = (page_size, d(_v), num_pages)
+                    mK_cur, mV_cur = [t[None, None, head_idx_kv, None] for t in (mK, mV)]
+                    # gK = (tile_n, tile_hdim, n_tiles per page, num_pages)
+                    gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (None, 0, None))
+                    gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0, None))
+                    # gK = ((tile_n, tile_hdim), (n_tiles per page, num_pages))
+                    gK = cute.group_modes(gK, 2, 4)
+                    gV = cute.group_modes(gV, 2, 4)
                 if const_expr(self.use_tma_Q):
                     gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
                     load_Q, _, _ = copy_utils.tma_get_copy_fn(
@@ -1546,7 +1566,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 # if cute.arch.thread_idx()[0] == 0:
                 #     cute.printf("m_block = %d, n_block_min: %d, n_block_max: %d", m_block, n_block_min, n_block_max)
                 for i in cutlass.range(n_block_max - n_block_min, unroll=2):
-                    n_block = n_block_max - i - 1
+                    if cutlass.const_expr(mPageTable is None):
+                        n_block = n_block_max - i - 1
+                    else:
+                        n_block = mPageTable[batch_idx, n_block_max - i - 1] if const_expr(mPageTable is not None) else None
                     pipeline_k.producer_acquire(kv_producer_state)
                     load_K(src_idx=n_block, producer_state=kv_producer_state)
                     pipeline_v.producer_acquire(kv_producer_state)
