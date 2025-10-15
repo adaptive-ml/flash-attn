@@ -285,6 +285,7 @@ def _flash_attn_fwd(
 
 _flash_attn_fwd.compile_cache = {}
 
+# Probably need to call this manually in bwd pass for paged?
 def _flash_attn_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -313,6 +314,9 @@ def _flash_attn_bwd(
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     page_table: Optional[torch.Tensor] = None, # k, v, dk, dv
+    dq: Optional[torch.Tensor] = None,
+    dk: Optional[torch.Tensor] = None,
+    dv: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = [
         maybe_contiguous(t) 
@@ -399,9 +403,15 @@ def _flash_attn_bwd(
 
     device = q.device
     # TODO: check if this is the right rounding
-    dq = torch.empty_like(q)
-    dk = torch.empty_like(k)
-    dv = torch.empty_like(v)
+    if page_table is not None:
+        dk = torch.zeros_like(k)
+        dv = torch.zeros_like(v)
+    if dq is None:
+        dq = torch.empty_like(q)
+    if dk is None:
+        dk = torch.empty_like(k)
+    if dv is None:
+        dv = torch.empty_like(v)
 
     head_dim_rounded = (head_dim + 32 - 1) // 32 * 32
 

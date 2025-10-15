@@ -1113,20 +1113,33 @@ class FlashAttentionBackwardSm80:
             # copy acc dK and acc_dV from rmem to gmem
             for rest_m in cutlass.range_constexpr(cute.size(tdKrdK.shape[1])):
                 if t0dKcdK[0, rest_m, 0][0] < seqlen.seqlen_k - n_block * self.n_block_size - tdKcdK[0][0]:
-                    cute.copy(
-                        gmem_tiled_copy_dK,
-                        tdKrdK[None, rest_m, None],
-                        tdKgdK[None, rest_m, None],
-                        pred=tdKpdK[None, rest_m, None] if cutlass.const_expr(self.check_hdim_oob) else None,
-                    )
+                    if cutlass.const_expr(mPageTable is None):
+                    # if cutlass.const_expr(True):
+                        cute.copy(
+                            gmem_tiled_copy_dK,
+                            tdKrdK[None, rest_m, None],
+                            tdKgdK[None, rest_m, None],
+                            pred=tdKpdK[None, rest_m, None] if cutlass.const_expr(self.check_hdim_oob) else None,
+                        )
+                    else:
+                        # Pred isn't too hard to add, but not sure if I can do constexpr nicely?
+                        # For now, we assume hdim is sufficiently round --> no pred
+                        for i in cutlass.range(cute.size(tdKrdK), unroll_full=True):
+                            tdKgdK[None, rest_m, None][i] += tdKrdK[None, rest_m, None][i]
+
             for rest_m in cutlass.range_constexpr(cute.size(tdVrdV.shape[1])):
                 if t0dVcdV[0, rest_m, 0][0] < seqlen.seqlen_k - n_block * self.n_block_size - tdVcdV[0][0]:
-                    cute.copy(
-                        gmem_tiled_copy_dV,
-                        tdVrdV[None, rest_m, None],
-                        tdVgdV[None, rest_m, None],
-                        pred=tdVpdV[None, rest_m, None] if cutlass.const_expr(self.check_hdim_v_oob) else None,
-                    )
+                    if cutlass.const_expr(mPageTable is None):
+                        cute.copy(
+                            gmem_tiled_copy_dV,
+                            tdVrdV[None, rest_m, None],
+                            tdVgdV[None, rest_m, None],
+                            pred=tdVpdV[None, rest_m, None] if cutlass.const_expr(self.check_hdim_v_oob) else None,
+                        )
+                    else:
+                        # For now, we assume hdim is sufficiently round --> no pred
+                        for i in cutlass.range(cute.size(tdVrdV), unroll_full=True):
+                            tdVgdV[None, rest_m, None][i] += tdVrdV[None, rest_m, None][i]
 
         else:  # qhead_per_kvhead > 1, do atomic add
             # For Sm90, we need to sync to avoid racy writes to smem_q
