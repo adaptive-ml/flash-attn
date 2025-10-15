@@ -391,9 +391,9 @@ class FlashAttentionBackwardSm80:
 
         num_head = mQ.shape[1] if cutlass.const_expr(mCuSeqlensQ is not None) else mQ.shape[2]
 
-        if cutlass.const_expr(mCuSeqlensK is not None):
+        if cutlass.const_expr(mCuSeqlensK is not None or mSeqUsedK is not None):
             TileScheduler = SingleTileVarlenScheduler
-            num_batch = mCuSeqlensK.shape[0] - 1
+            num_batch = mCuSeqlensK.shape[0] - 1 if mCuSeqlensK is not None else mSeqUsedK.shape[0]
         else:
             TileScheduler = SingleTileScheduler
             num_batch = mK.shape[0]
@@ -406,12 +406,18 @@ class FlashAttentionBackwardSm80:
             seqlen_k=0,
             headdim=mK.shape[2],
             headdim_v=mV.shape[2],
-            total_q=mK.shape[0],
+            # If paged, we are overestimating but only used in upper bound block estimate I think...
+            total_q=mK.shape[0] if mPageTable is None else mK.shape[0] * mK.shape[1],
             tile_shape_mn=(self.n_block_size, self.m_block_size),
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
             mCuSeqlensQ=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedK,
         )
+
+        if cutlass.const_expr(mPageTable is not None):
+            # Transpose to reuse fwd tiling
+            KV_layout_transpose = [1, 3, 2, 0]
+            mK, mV, mdK, mdV = [utils.select(t, KV_layout_transpose) for t in (mK, mV, mdK, mdV)]
         
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
@@ -508,7 +514,16 @@ class FlashAttentionBackwardSm80:
         n_block, head_idx, batch_idx = work_tile.tile_idx
 
         if work_tile.is_valid_tile:
-            seqlen = SeqlenInfoQK(batch_idx, mQ.shape[1], mK.shape[1], mCuSeqlensQ=mCuSeqlensQ, mCuSeqlensK=mCuSeqlensK, mSeqUsedQ=mSeqUsedQ, mSeqUsedK=mSeqUsedK)
+            seqlen = SeqlenInfoQK(
+                batch_idx, 
+                # Only used if q is not varlen
+                seqlen_q_static=mQ.shape[1] if cutlass.const_expr(not self.pack_gqa) else mQ.shape[0][1],
+                seqlen_k_static=cute.size(mK.shape[1]) if cutlass.const_expr(mPageTable is None) else mK.shape[1] * mPageTable.shape[1],
+                mCuSeqlensQ=mCuSeqlensQ, 
+                mCuSeqlensK=mCuSeqlensK,
+                mSeqUsedQ=mSeqUsedQ, 
+                mSeqUsedK=mSeqUsedK
+            )
 
             m_block_max = cute.ceil_div(seqlen.seqlen_q, self.m_block_size)
             m_block_min = 0
@@ -542,17 +557,33 @@ class FlashAttentionBackwardSm80:
                 mdQaccum_cur = cute.domain_offset((padded_offset_q * self.head_dim_padded,), mdQaccum[head_idx, None])
             head_idx_kv = head_idx // self.qhead_per_kvhead if cutlass.const_expr(not self.pack_gqa) else head_idx
 
-            if cutlass.const_expr(not seqlen.has_cu_seqlens_k):
-                mK_cur, mV_cur = [t[batch_idx, None, head_idx_kv, None] for t in (mK, mV)]
+            page_idx = mPageTable[batch_idx, n_block] if cutlass.const_expr(mPageTable is not None) else None
+
+            if cutlass.const_expr(mPageTable is None):
+                if cutlass.const_expr(not seqlen.has_cu_seqlens_k):
+                    mK_cur, mV_cur = [t[batch_idx, None, head_idx_kv, None] for t in (mK, mV)]
+                else:
+                    mK_cur, mV_cur = [cute.domain_offset((seqlen.offset_k, 0), t[None, head_idx_kv, None]) for t in (mK, mV)]
+                # (n_block_size, head_dim)
+                gK = cute.local_tile(mK_cur, blkK_shape, (n_block, 0))
+                # (n_block_size, head_dim_v)
+                gV = cute.local_tile(mV_cur, blkV_shape, (n_block, 0))
             else:
-                mK_cur, mV_cur = [cute.domain_offset((seqlen.offset_k, 0), t[None, head_idx_kv, None]) for t in (mK, mV)]
+                # mK = (page_size, d, h_k, num_pages)
+                # mK_cur = (page_size, d(_v), num_pages)
+                mK_cur, mV_cur = [t[None, None, head_idx_kv, None] for t in (mK, mV)]
+                # gK = (tile_n, tile_hdim, n_tiles per page, num_pages)
+                gK = cute.local_tile(mK_cur, blkK_shape, (None, 0, None))
+                gV = cute.local_tile(mV_cur, blkV_shape, (None, 0, None))
+                # gK = (tile_n, tile_hdim, (n_tiles per page, num_pages))
+                gK = cute.group_modes(gK, 2, 4)
+                gV = cute.group_modes(gV, 2, 4)
+                # import pdb; pdb.set_trace()
+                gK = gK[None, None, page_idx]
+                gV = gV[None, None, page_idx]
 
             # (m_block_size, head_dim, m_block)
             gQ = cute.local_tile(mQ_cur, blkQ_shape, (None, 0))
-            # (n_block_size, head_dim)
-            gK = cute.local_tile(mK_cur, blkK_shape, (n_block, 0))
-            # (n_block_size, head_dim_v)
-            gV = cute.local_tile(mV_cur, blkV_shape, (n_block, 0))
             # (m_block_size, head_dim_v, m_block)
             gdO = cute.local_tile(mdO_cur, blkdO_shape, (None, 0))
             gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (None,))
@@ -821,7 +852,8 @@ class FlashAttentionBackwardSm80:
             self.epilogue(
                 acc_dK, acc_dV, mdK, mdV, sdK, sdV,
                 gmem_tiled_copy_dK, gmem_tiled_copy_dV, tiled_mma_dkv,
-                tidx, n_block, head_idx, batch_idx, seqlen, d_head, d_head_v
+                tidx, n_block, head_idx, batch_idx, seqlen, d_head, 
+                d_head_v, mPageTable, page_idx
             )
 
     @cute.jit
@@ -999,7 +1031,9 @@ class FlashAttentionBackwardSm80:
         batch_size: cutlass.Int32,
         seqlen: SeqlenInfoQK,
         d_head: cutlass.Int32, 
-        d_head_v: cutlass.Int32
+        d_head_v: cutlass.Int32,
+        mPageTable: Optional[cute.Tensor], # TODO: maybe do this cleaner..., page_idx is not constexpr so passing this in
+        page_idx: Optional[cutlass.Int32],
     ):
         rdV = cute.make_fragment_like(acc_dV, self.dtype)
         rdV.store(acc_dV.load().to(self.dtype))
@@ -1028,16 +1062,25 @@ class FlashAttentionBackwardSm80:
             cute.copy(smem_copy_atom_dKV, taccdVrdV, taccdVsdV)
             cute.copy(smem_copy_atom_dKV, taccdKrdK, taccdKsdK)
 
-
-            if cutlass.const_expr(not seqlen.has_cu_seqlens_k):
-                mdK_cur, mdV_cur = [t[batch_idx, None, head_idx_kv, None] for t in (mdK, mdV)]
-            else:
-                mdK_cur, mdV_cur = [cute.domain_offset((seqlen.offset_k, 0), t[None, head_idx_kv, None]) for t in (mdK, mdV)]
-
             blkdK_shape = (self.n_block_size, self.head_dim_padded)
             blkdV_shape = (self.n_block_size, self.head_dim_v_padded)
-            gdK = cute.local_tile(mdK_cur, blkdK_shape, (n_block, 0))
-            gdV = cute.local_tile(mdV_cur, blkdV_shape, (n_block, 0))
+
+            if cutlass.const_expr(mPageTable is None):
+                if cutlass.const_expr(not seqlen.has_cu_seqlens_k):
+                    mdK_cur, mdV_cur = [t[batch_idx, None, head_idx_kv, None] for t in (mdK, mdV)]
+                else:
+                    mdK_cur, mdV_cur = [cute.domain_offset((seqlen.offset_k, 0), t[None, head_idx_kv, None]) for t in (mdK, mdV)]
+                gdK = cute.local_tile(mdK_cur, blkdK_shape, (n_block, 0))
+                gdV = cute.local_tile(mdV_cur, blkdV_shape, (n_block, 0))
+            else:
+                mdK_cur, mdV_cur = [t[None, None, head_idx_kv, None] for t in (mdK, mdV)]
+                gdK = cute.local_tile(mdK_cur, blkdK_shape, (None, 0, None))
+                gdV = cute.local_tile(mdV_cur, blkdV_shape, (None, 0, None))
+                gdK = cute.group_modes(gdK, 2, 4)
+                gdV = cute.group_modes(gdV, 2, 4)
+                gdK = gdK[None, None, page_idx]
+                gdV = gdV[None, None, page_idx]
+
             tdKsdK = gmem_thr_copy_dK.partition_S(sdK)
             tdKgdK = gmem_thr_copy_dK.partition_D(gdK)
             tdVsdV = gmem_thr_copy_dV.partition_S(sdV)

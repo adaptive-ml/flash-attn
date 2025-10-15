@@ -319,6 +319,13 @@ def _flash_attn_bwd(
         for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
     ]
     num_head, head_dim = q.shape[-2:]
+    # Fixed Len
+    # Q, K, V = (B, S, H, D)
+    # Var Len
+    # Q, K, V = (S_tot, H, D) 
+    # Var Len (Page Table)
+    # K, V = (n_pages, page_size, H, D)
+
     if cu_seqlens_q is None:
         batch_size, seqlen_q = q.shape[:2]
         total_q = batch_size * seqlen_q
@@ -327,15 +334,15 @@ def _flash_attn_bwd(
         seqlen_q = None
         total_q = q.shape[0]
 
-    if cu_seqlens_k is None:
-        batch_size, seqlen_k = k.shape[:2]
-        total_k = batch_size * seqlen_k
-    else:
-        batch_size = cu_seqlens_k.shape[0] - 1
-        seqlen_k = None
-        total_k = k.shape[0]
+    if page_table is None:
+        if cu_seqlens_k is None:
+            _, seqlen_k = k.shape[:2]
+            total_k = batch_size * seqlen_k
+        else:
+            seqlen_k = None
+            total_k = k.shape[0]
 
-    # TODO: Maybe make this cleaner
+    # TODO: Maybe make this cleaner (also above^)
     if page_table is not None:
         assert cu_seqlens_k is None, "page_table is not supported with cu_seqlens_k"
         assert page_table.dtype == torch.int32, "page_table must be int32"
@@ -467,6 +474,7 @@ def _flash_attn_bwd(
     m_block_size = 64
     n_block_size = 128
     if compile_key not in _flash_attn_bwd.compile_cache:
+        assert page_size in [None, n_block_size], f"Only page_size={n_block_size} is supported for paged KV on SM 8.0"
         fa_bwd_sm80 = FlashAttentionBackwardSm80(
             dtype,
             head_dim,
@@ -701,6 +709,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             cu_seqlens_k=cu_seqlens_k,
             seqused_q=seqused_q,
             seqused_k=seqused_k,
+            page_table=page_table,
         )
 
         return dq, dk, dv, *((None,) * 11)
