@@ -230,5 +230,7 @@ def test_fwd_page_table(
     # Should be exactly the same...
     atol=3e-8 
     rtol=3e-8
-    _stats("out", out_varlen, out_paged, atol=atol, rtol=rtol)
-    _stats("lse", lse_varlen, lse_paged, atol=atol, rtol=rtol)
+    mean_ok_out = _stats("out", out_varlen, out_paged, atol=atol, rtol=rtol)
+    mean_ok_lse = _stats("lse", lse_varlen, lse_paged, atol=atol, rtol=rtol)
+    assert mean_ok_out
+    assert mean_ok_lse

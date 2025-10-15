@@ -277,7 +277,7 @@ def reconstruct_paged(
 @pytest.mark.parametrize("n_heads", [1, 4, 7])
 @pytest.mark.parametrize("d_head", [64, 128])
 # @pytest.mark.parametrize("d_head", [192]) # Makes launch params illegal?
-@pytest.mark.parametrize("max_seq_len", [128 * 16, 128 * 32, 128 * 80, 192 * 80])
+@pytest.mark.parametrize("max_seq_len", [256, 128 * 16, 128 * 32, 128 * 80, 192 * 80])
 @pytest.mark.parametrize("causal", [True, False])
 def test_fwd_page_table(
     batch_size: int,
@@ -331,8 +331,10 @@ def test_fwd_page_table(
     # Should be exactly the same...
     fwd_atol=3e-8 
     fwd_rtol=3e-8
-    _stats("out", out_varlen, out_paged, atol=fwd_atol, rtol=fwd_rtol)
-    _stats("lse", lse_varlen, lse_paged, atol=fwd_atol, rtol=fwd_rtol)
+    mean_ok_out = _stats("out", out_varlen, out_paged, atol=fwd_atol, rtol=fwd_rtol)
+    mean_ok_lse = _stats("lse", lse_varlen, lse_paged, atol=fwd_atol, rtol=fwd_rtol)
+    assert mean_ok_out
+    assert mean_ok_lse
 
     # paged bwd
     out_paged.backward(grad_paged, retain_graph=False)
@@ -347,9 +349,12 @@ def test_fwd_page_table(
 
     dk_paged_reshaped, dv_paged_reshaped = reconstruct_packed_from_paged(dk_paged, dv_paged, page_table, seqused_k, cu_seqlens_k, page_size)
 
-    _stats("dQ", dq_varlen, dq_paged, atol=atol, rtol=rtol)
-    _stats("dK", dk_varlen, dk_paged_reshaped, atol=atol, rtol=rtol)
-    _stats("dV", dv_varlen, dv_paged_reshaped, atol=atol, rtol=rtol)
+    mean_ok_dq = _stats("dQ", dq_varlen, dq_paged, atol=atol, rtol=rtol)
+    mean_ok_dk = _stats("dK", dk_varlen, dk_paged_reshaped, atol=atol, rtol=rtol)
+    mean_ok_dv = _stats("dV", dv_varlen, dv_paged_reshaped, atol=atol, rtol=rtol)
+    assert mean_ok_dq
+    assert mean_ok_dk
+    assert mean_ok_dv
 
     ok_q = torch.allclose(dq_varlen.float(), dq_paged.float(), atol=atol, rtol=rtol)
     ok_k = torch.allclose(dk_varlen.float(), dk_paged_reshaped.float(), atol=atol, rtol=rtol)

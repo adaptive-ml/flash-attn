@@ -1124,7 +1124,8 @@ class FlashAttentionBackwardSm80:
                     else:
                         # Pred isn't too hard to add, but not sure if I can do constexpr nicely?
                         # For now, we assume hdim is sufficiently round --> no pred
-                        for i in cutlass.range(cute.size(tdKrdK), unroll_full=True):
+                        for i in cutlass.range(cute.size(tdKrdK[None, rest_m, None]), unroll_full=True):
+                            # if (tdKpdK[None, rest_m, None][i] and self.check_hdim_oob) or not self.check_hdim_oob:
                             tdKgdK[None, rest_m, None][i] += tdKrdK[None, rest_m, None][i]
 
             for rest_m in cutlass.range_constexpr(cute.size(tdVrdV.shape[1])):
@@ -1138,7 +1139,8 @@ class FlashAttentionBackwardSm80:
                         )
                     else:
                         # For now, we assume hdim is sufficiently round --> no pred
-                        for i in cutlass.range(cute.size(tdVrdV), unroll_full=True):
+                        for i in cutlass.range(cute.size(tdVrdV[None, rest_m, None]), unroll_full=True):
+                            # if (tdVpdV[None, rest_m, None][i] and self.check_hdim_oob) or not self.check_hdim_oob:
                             tdVgdV[None, rest_m, None][i] += tdVrdV[None, rest_m, None][i]
 
         else:  # qhead_per_kvhead > 1, do atomic add
