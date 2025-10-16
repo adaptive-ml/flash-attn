@@ -1,6 +1,12 @@
+import pytest
+
 import torch
 from typing import Tuple
-from flash_attn.cute import flash_attn_varlen_func, _flash_attn_fwd, _flash_attn_bwd
+from flash_attn.cute import(
+    flash_attn_varlen_func, 
+    _flash_attn_fwd, 
+    _flash_attn_bwd,
+)
 
 def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
@@ -49,16 +55,11 @@ def generate_args(
     max_num_pages = ceil_div(max_seq_len, page_size)
 
     # --- sample per-seq token lengths (varlen); ensure >=1 token
-    # seqused_q = seqused_k = torch.randint(1, max_seq_len + 1, (batch_size,), dtype=torch.int32)
+    # seqused_q = torch.randint(1, max_seq_len + 1, (batch_size,), dtype=torch.int32)
     # seqused_k = torch.randint(1, max_seq_len + 1, (batch_size,), dtype=torch.int32)
-    # seqused_q = torch.randint(max_seq_len, max_seq_len + 1, (batch_size,), dtype=torch.int32)
-    # seqused_k = torch.randint(max_seq_len, max_seq_len + 1, (batch_size,), dtype=torch.int32)
-
-
     seqused_q = torch.tensor([max_seq_len], dtype=torch.int32)
     seqused_k = torch.tensor([max_seq_len], dtype=torch.int32)
 
-    # import pdb; pdb.set_trace()
 
     # What would it mean to have more query than kv...?
     with torch.no_grad():
@@ -183,7 +184,7 @@ def clone_like(t):
 def _stats(name, a, b, atol, rtol):
     diff = (a - b).float()
     mean_abs = diff.abs().mean().item()
-    mean_rel = (diff.abs().mean() / b.abs().mean().item())
+    mean_rel = (diff.abs().mean() / (b.abs().mean().item() + 1e-10))
     print(f"{name}: mean_abs={mean_abs:.4e}, mean_rel={mean_rel:.4e}, sum_fa={a.sum()}, sum_ref={b.sum()}")
     return mean_abs < atol and mean_rel < rtol
 
@@ -311,11 +312,30 @@ def chunk(
 
     return q_chunked, out_chunked, lse_chunked, grad_chunked, dq_chunked
 
-if __name__ == "__main__":
-    # Only testing causal for now, don't think causal=False should work
-    causal = True
-    # page_size = 128 if causal else 192
+@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize("n_heads", [1, 4, 10])
+@pytest.mark.parametrize("d_head", [64, 128])
+@pytest.mark.parametrize("seq_len", [1, 32, 1024, 2048, 3000, 4096, 5000, 8192, 10000, 100000])
+@pytest.mark.parametrize("n_chunks", [1, 2, 8, 24])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("causal", [True])
+# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+def test_diff_kv(
+    batch_size: int,
+    n_heads: int,
+    d_head: int,
+    seq_len: int,
+    n_chunks: int,
+    dtype,
+    causal: bool,
+):
+    assert batch_size == 1
+    assert causal == True
+
     page_size = 128
+    if n_chunks > ceil_div(seq_len, page_size):
+        pytest.skip('n_chunks has to be <= num pages')
+
     (
         q0, k0, v0, 
         qc, kc, vc, 
@@ -325,22 +345,19 @@ if __name__ == "__main__":
         cu_seqlens_q, 
         cu_seqlens_k 
     ) = generate_args(
-        batch_size=1, 
-        n_heads=10, 
-        d_head=64, 
-        max_seq_len=132201,
-        dtype=torch.float16,
+        batch_size=batch_size, 
+        n_heads=n_heads, 
+        d_head=d_head, 
+        max_seq_len=seq_len, 
+        dtype=dtype,
         page_size=page_size,
     )
-
-    n_chunks = 3 # min(3, ceil_div(qc.shape[0], page_size))
 
     # Use the same upstream gradient to compare backward paths
     # good enough for now since assuming headdim = headdim_v
     grad_out = torch.randn_like(q0)
 
     grad_varlen = clone_like(grad_out)
-    grad_varlen_two = clone_like(grad_out)
     grad_paged = clone_like(grad_out)
 
     # Varlen Computation
@@ -375,6 +392,7 @@ if __name__ == "__main__":
         pack_gqa=None,
     )
 
+    n_chunks = min(3, ceil_div(qc.shape[0], page_size))
     dq_paged = torch.empty_like(qc)
     # Views of chunks
     (
@@ -399,7 +417,6 @@ if __name__ == "__main__":
 
     dk_paged = torch.zeros_like(kc)
     dv_paged = torch.zeros_like(vc)
-    n_pages = kc.shape[0]
     offset = 0
     total_seq_len = qc.shape[0] # for now...
     seq_len_remaining = total_seq_len
@@ -498,13 +515,23 @@ if __name__ == "__main__":
         page_size
     )
 
-    _stats("dQ", dq_varlen, dq_paged, atol=atol, rtol=rtol)
-    _stats("dK", dk_varlen, dk_paged_reshaped, atol=atol, rtol=rtol)
-    _stats("dV", dv_varlen, dv_paged_reshaped, atol=atol, rtol=rtol)
+    mean_dq_ok = _stats("dQ", dq_varlen, dq_paged, atol=atol, rtol=rtol)
+    mean_dk_ok = _stats("dK", dk_varlen, dk_paged_reshaped, atol=atol, rtol=rtol)
+    mean_dv_ok = _stats("dV", dv_varlen, dv_paged_reshaped, atol=atol, rtol=rtol)
 
     ok_q = torch.allclose(dq_varlen.float(), dq_paged.float(), atol=atol, rtol=rtol)
     ok_k = torch.allclose(dk_varlen.float(), dk_paged_reshaped.float(), atol=atol, rtol=rtol)
     ok_v = torch.allclose(dv_varlen.float(), dv_paged_reshaped.float(), atol=atol, rtol=rtol)
     print(f"Close? dQ={ok_q}, dK={ok_k}, dV={ok_v}")
 
-    import pdb; pdb.set_trace()
+    assert dq_paged.isnan().sum() == 0
+    assert dk_paged_reshaped.isnan().sum() == 0
+    assert dv_paged_reshaped.isnan().sum() == 0
+
+    assert mean_dq_ok
+    assert mean_dk_ok
+    assert mean_dv_ok
+
+    assert ok_q
+    assert ok_k
+    assert ok_v
