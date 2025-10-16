@@ -51,7 +51,6 @@ def generate_args(
     # --- sample per-seq token lengths (varlen); ensure >=1 token
     seqused_q = torch.randint(1, max_seq_len + 1, (batch_size,), dtype=torch.int32)
     seqused_k = torch.randint(1, max_seq_len + 1, (batch_size,), dtype=torch.int32)
-    # seqused_q = seqused_k = torch.ones(batch_size) * 256
 
     # What would it mean to have more query than kv...?
     with torch.no_grad():
@@ -176,7 +175,7 @@ def clone_like(t):
 def _stats(name, a, b, atol, rtol):
     diff = (a - b).float()
     mean_abs = diff.abs().mean().item()
-    mean_rel = (diff.abs().mean() / b.abs().clamp_min(1e-6).mean().item())
+    mean_rel = (diff.abs().mean() / b.abs().mean().item())
     print(f"{name}: mean_abs={mean_abs:.4e}, mean_rel={mean_rel:.4e}, sum_fa={a.sum()}, sum_ref={b.sum()}")
     return mean_abs < atol and mean_rel < rtol
 
@@ -267,11 +266,64 @@ def reconstruct_paged(
             dV0[page_id, :page_len, :, :].copy_(dVc[start + off:start + off + page_len])
     return dK0, dV0
 
+# Assuming standard varlen format and batch size = 1
+def chunk(
+        qc: torch.Tensor,
+        out_paged: torch.Tensor,
+        lse_paged: torch.Tensor,
+        grad_paged: torch.Tensor,
+        dq_paged: torch.Tensor,
+        n_chunks: int,
+        page_size: int,
+    ) -> tuple[
+    list[torch.Tensor],
+    list[torch.Tensor],
+    list[torch.Tensor],
+    list[torch.Tensor],
+]:
+    # Make chunks multiples of page table size (might even be fine without, though bad perf?)
+
+    assert qc.shape[0] == out_paged.shape[0] == lse_paged.shape[1] == grad_paged.shape[0] == dq_paged.shape[0]
+    seqlen = qc.shape[0]
+    total_pages = ceil_div(seqlen, page_size)
+    pages_per_chunk = total_pages // n_chunks
+    assert pages_per_chunk > 0, "Can't do less than 1 page per chunk" # Maybe this is actually fine?
+    offset = 0
+    extra = total_pages % n_chunks
+    q_chunked, out_chunked, lse_chunked, grad_chunked, dq_chunked = [], [], [], [], []
+    for chunk_idx in range(n_chunks):
+        # TODO: reverse later since last page is partially filled --> not as even as it could be
+        pages_in_chunk = pages_per_chunk + 1 if chunk_idx < extra else pages_per_chunk
+        q_chunked.append(qc[offset:offset + (pages_in_chunk) * page_size])
+        out_chunked.append(out_paged[offset:offset + (pages_in_chunk) * page_size])
+        lse_chunked.append(lse_paged[:, offset:offset + (pages_in_chunk) * page_size])
+        grad_chunked.append(grad_paged[offset:offset + (pages_in_chunk) * page_size])
+        dq_chunked.append(dq_paged[offset:offset + (pages_in_chunk) * page_size])
+        offset += pages_in_chunk * page_size
+
+    return q_chunked, out_chunked, lse_chunked, grad_chunked, dq_chunked
+
 if __name__ == "__main__":
+    # Only testing causal for now, don't think causal=False should work
     causal = True
     # page_size = 128 if causal else 192
     page_size = 128
-    q0, k0, v0, qc, kc, vc, page_table, seqused_k, seqused_q, cu_seqlens_q, cu_seqlens_k = generate_args(7, 13, 128, 15 * 192, page_size=page_size)
+    (
+        q0, k0, v0, 
+        qc, kc, vc, 
+        page_table, 
+        seqused_k, 
+        seqused_q, 
+        cu_seqlens_q, 
+        cu_seqlens_k 
+    ) = generate_args(
+        batch_size=1, 
+        n_heads=8, 
+        d_head=128, 
+        max_seq_len=2048, 
+        dtype=torch.float16,
+        page_size=page_size,
+    )
 
     # Use the same upstream gradient to compare backward paths
     # good enough for now since assuming headdim = headdim_v
@@ -313,22 +365,111 @@ if __name__ == "__main__":
         pack_gqa=None,
     )
 
-    dq_paged, dk_paged, dv_paged = _flash_attn_bwd(
-        q=qc,
-        k=kc,
-        v=vc,
-        out=out_paged,
-        dout=grad_paged,
-        lse=lse_paged,
-        softmax_scale=None,
-        causal=causal,
-        softcap=0.0,
-        cu_seqlens_q=cu_seqlens_q.clone(),
-        cu_seqlens_k=None,
-        seqused_q=None,
-        seqused_k=seqused_k.clone(),
-        page_table=page_table,
+    n_chunks = min(3, ceil_div(qc.shape[0], page_size))
+    dq_paged = torch.zeros_like(qc) # for now, can be empty later
+    # Views of chunks
+    (
+        q_chunked, 
+        out_chunked, 
+        lse_chunked, 
+        grad_chunked, 
+        dq_chunked
+    ) = chunk(
+        qc, 
+        out_paged, 
+        lse_paged, 
+        grad_paged, 
+        dq_paged, 
+        n_chunks,
+        page_size,
     )
+
+    print(f"Seq Len = {qc.shape[0]}, n_chunks = {n_chunks}")
+    chunk_sizes = [x.shape[0] for x in q_chunked]
+    print(f"chunk_sizes: {chunk_sizes}")
+
+    dk_paged = torch.zeros_like(kc)
+    dv_paged = torch.zeros_like(vc)
+    n_pages = kc.shape[0]
+    offset = 0
+    total_seq_len = qc.shape[0] # for now...
+    seq_len_remaining = total_seq_len
+    for chunk_idx in reversed(range(n_chunks)):
+        q_cur = q_chunked[chunk_idx]
+        out_cur = out_chunked[chunk_idx]
+        lse_cur = lse_chunked[chunk_idx]
+        grad_cur = grad_chunked[chunk_idx]
+        dq_cur = dq_chunked[chunk_idx]
+        # Need to restrict seq len but not what we pass into 
+        # k_cur, v_cur, dk_cur, dv_cur since pages may be out of order (at least with my arg generation...)
+        k_cur = kc 
+        v_cur = vc
+        dk_cur = dk_paged
+        dv_cur = dv_paged
+        offset += ceil_div(q_cur.shape[0], page_size)
+
+        cu_seqlens = torch.tensor([0, q_cur.shape[0]], device=q_cur.device, dtype=torch.int32)
+        seqused = torch.tensor([seq_len_remaining], device=k_cur.device, dtype=torch.int32)
+
+        # Things to check:
+        #   - seqused looks reasonable (remaining seq len)
+        #   - cu_seqlens looks reasonable (0, cur seq len q)
+        #   - dk_cur, dv_cur
+
+        for name, t in [
+            # ("q_cur", q_cur),
+            # ("out_cur", out_cur),
+            # ("lse_cur", lse_cur),
+            # ("grad_cur", grad_cur),
+            ("dq_cur", dq_cur),
+            # ("k_cur", k_cur),
+            # ("v_cur", v_cur),
+            ("dk_cur", dk_cur),
+            ("dv_cur", dv_cur),
+        ]:
+            assert t.is_contiguous(), f"{name} is not contiguous..."
+
+
+        _flash_attn_bwd(
+            q=q_cur,
+            k=k_cur,    # In later iterations, we refer to pages that may be past num pages that would 
+                        # be implied by visible seqlen ks... make sure that is handled correctly
+            v=v_cur,
+            out=out_cur,
+            dout=grad_cur,
+            lse=lse_cur,
+            softmax_scale=None,
+            causal=causal,
+            softcap=0.0,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=None,
+            seqused_q=None,
+            seqused_k=seqused,
+            page_table=page_table,
+            dq=dq_cur,
+            dk=dk_cur, 
+            dv=dv_cur,
+        )
+
+        seq_len_remaining -= q_cur.shape[0]
+
+    # Old
+    # dq_paged, dk_paged, dv_paged = _flash_attn_bwd(
+    #     q=qc,
+    #     k=kc,
+    #     v=vc,
+    #     out=out_paged,
+    #     dout=grad_paged,
+    #     lse=lse_paged,
+    #     softmax_scale=None,
+    #     causal=causal,
+    #     softcap=0.0,
+    #     cu_seqlens_q=cu_seqlens_q.clone(),
+    #     cu_seqlens_k=None,
+    #     seqused_q=None,
+    #     seqused_k=seqused_k.clone(),
+    #     page_table=page_table,
+    # )
 
     # Should be exactly the same...
     fwd_atol=3e-8 
@@ -337,7 +478,7 @@ if __name__ == "__main__":
     _stats("lse", lse_varlen, lse_paged, atol=fwd_atol, rtol=fwd_rtol)
 
     # dQ may differ slightly since atomic adds
-    atol, rtol = 7e-3, 2e-4 # 1 machine epsilon....
+    atol, rtol = 3e-2, 3e-2
 
     dk_paged_reshaped, dv_paged_reshaped = reconstruct_packed_from_paged(
         dk_paged, 

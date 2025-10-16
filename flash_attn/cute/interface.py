@@ -404,8 +404,10 @@ def _flash_attn_bwd(
     device = q.device
     # TODO: check if this is the right rounding
     if page_table is not None:
-        dk = torch.zeros_like(k)
-        dv = torch.zeros_like(v)
+        if dk is None:
+            dk = torch.zeros_like(k)
+        if dv is None:
+            dv = torch.zeros_like(v)
     if dq is None:
         dq = torch.empty_like(q)
     if dk is None:
