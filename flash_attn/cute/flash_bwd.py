@@ -1089,8 +1089,8 @@ class FlashAttentionBackwardSm80:
                 gdV = cute.local_tile(mdV_cur, blkdV_shape, (None, 0, None))
                 gdK = cute.group_modes(gdK, 2, 4)
                 gdV = cute.group_modes(gdV, 2, 4)
-                gdK = gdK[None, None, page_idx]
-                gdV = gdV[None, None, page_idx]
+                gdK = gdK[None, None, n_block_idx]
+                gdV = gdV[None, None, n_block_idx]
 
             tdKsdK = gmem_thr_copy_dK.partition_S(sdK)
             tdKgdK = gmem_thr_copy_dK.partition_D(gdK)

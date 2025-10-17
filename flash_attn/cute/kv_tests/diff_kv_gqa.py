@@ -442,7 +442,6 @@ def diff_kv_runner(
         dk_accum=dk_accum, dv_accum=dv_accum,
     )
 
-    n_pages = kc.shape[0]
     offset = 0
     total_seq_len = q.shape[0] # for now
     seq_len_remaining = total_seq_len
