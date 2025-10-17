@@ -62,8 +62,8 @@ def diff_kv_setup(
     ) = [
         maybe_contiguous(t) 
         for t in (
-            q, k, v, 
-            out, dout, lse, 
+            q, k, v,
+            out, dout, lse,
             cu_seqlens_q, seqused_k,
             page_table,
             dq, dk, dv,
@@ -284,7 +284,7 @@ def flash_diff_kv_bwd_chunk(
         AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs, page_table is None
     )
     if compile_key not in flash_diff_kv_bwd_chunk.compile_cache:
-        assert page_size in [None, n_block_size], f"Only page_size={n_block_size} is supported for paged KV on SM 8.0"
+        assert page_size == None or page_size % n_block_size == 0, f"Only page_size values that are multiples of {n_block_size} are supported for paged KV on SM 8.0"
         fa_bwd_sm80 = FlashAttentionBackwardSm80(
             dtype,
             head_dim,
@@ -508,9 +508,7 @@ def diff_kv_runner(
 
     seqused_k_tensor = None
     cu_seqlens_k_tensor = None
-    # TODO: dlpack seqused_k_tensor
-    # TODO: Postprocess on dk_accum, dv_accum if necessary result
-    # dk_accum is (n_pages, head_idx_kv, page_size * d_head)... 
+    # dk_accum is (n_pages, head_idx_kv, page_size * d_head)
     # can maybe just pretend this is fixed_len with batch_size=n_pages and seq_len = page_size
     # ^seems to work, but note that this touches parts of the last page that are supposed to be unfilled 
     # (don't think it matters though unless we expect those things to be zeroed or something across runs?)
@@ -522,7 +520,6 @@ def diff_kv_runner(
                 dtype, head_dim, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
             )
             # TODO: check @can_implement
-            # import pdb; pdb.set_trace()
             diff_kv_runner.compile_cache_post[compile_key_post] = cute.compile(
                 fa_bwd_post, dk_accum_tensor, dk_tensor, softmax_scale, cu_seqlens_k_tensor, seqused_k_tensor, current_stream
             )
@@ -552,7 +549,7 @@ if __name__ == "__main__":
     causal = True
     mha_type = 'gqa'
     # page_size = 128 if causal else 192
-    page_size = 128
+    page_size = 256
     (
         q0, k0, v0, 
         qc, kc, vc, 

@@ -126,6 +126,7 @@ def chunk(
 ]:
     # Make chunks multiples of page table size (might even be fine without, though bad perf?)
     # ^ for GQA/MQA we definitely cannot chunk across pages
+    # TODO: maybe look into what a good chunking strategy is?
 
     assert qc.shape[0] == out_paged.shape[0] == lse_paged.shape[1] == grad_paged.shape[0] == dq_paged.shape[0]
     seqlen = qc.shape[0]

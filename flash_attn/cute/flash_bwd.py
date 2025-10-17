@@ -564,7 +564,11 @@ class FlashAttentionBackwardSm80:
                 mdQaccum_cur = cute.domain_offset((padded_offset_q * self.head_dim_padded,), mdQaccum[head_idx, None])
             head_idx_kv = head_idx // self.qhead_per_kvhead if cutlass.const_expr(not self.pack_gqa) else head_idx
 
-            page_idx = mPageTable[batch_idx, n_block] if cutlass.const_expr(mPageTable is not None) else None
+            
+            tiles_per_page = mK.shape[0] // self.n_block_size
+            page_idx = mPageTable[batch_idx, n_block // tiles_per_page] if cutlass.const_expr(mPageTable is not None) else 0
+            residue = n_block % tiles_per_page
+            n_block_idx = page_idx * tiles_per_page + residue
 
             if cutlass.const_expr(mPageTable is None):
                 if cutlass.const_expr(not seqlen.has_cu_seqlens_k):
@@ -586,8 +590,8 @@ class FlashAttentionBackwardSm80:
                 gK = cute.group_modes(gK, 2, 4)
                 gV = cute.group_modes(gV, 2, 4)
                 # import pdb; pdb.set_trace()
-                gK = gK[None, None, page_idx]
-                gV = gV[None, None, page_idx]
+                gK = gK[None, None, n_block_idx]
+                gV = gV[None, None, n_block_idx]
 
             # (m_block_size, head_dim, m_block)
             gQ = cute.local_tile(mQ_cur, blkQ_shape, (None, 0))
@@ -860,7 +864,7 @@ class FlashAttentionBackwardSm80:
                 acc_dK, acc_dV, mdK, mdV, sdK, sdV,
                 gmem_tiled_copy_dK, gmem_tiled_copy_dV, tiled_mma_dkv,
                 tidx, n_block, head_idx, batch_idx, seqlen, d_head, 
-                d_head_v, mPageTable, page_idx
+                d_head_v, mPageTable, n_block_idx
             )
 
     @cute.jit
@@ -1040,7 +1044,7 @@ class FlashAttentionBackwardSm80:
         d_head: cutlass.Int32, 
         d_head_v: cutlass.Int32,
         mPageTable: Optional[cute.Tensor], # TODO: maybe do this cleaner..., page_idx is not constexpr so passing this in
-        page_idx: Optional[cutlass.Int32],
+        n_block_idx: Optional[cutlass.Int32], # Only for paged
     ):
         rdV = cute.make_fragment_like(acc_dV, self.dtype)
         rdV.store(acc_dV.load().to(self.dtype))
@@ -1172,10 +1176,12 @@ class FlashAttentionBackwardSm80:
                 # (page_size * d_head, n_pages)
                 mdK_cur, mdV_cur = [t[None, head_idx_kv, None] for t in (mdK, mdV)]
                 # ((page_size * d_head), n_pages)
-                gdK = cute.local_tile(mdK_cur, blkdK_shape, (0, None))
-                gdV = cute.local_tile(mdV_cur, blkdV_shape, (0, None))
-                gdK = gdK[None, page_idx]
-                gdV = gdV[None, page_idx]
+                gdK = cute.local_tile(mdK_cur, blkdK_shape, (None, None))
+                gdV = cute.local_tile(mdV_cur, blkdV_shape, (None, None))
+                gdK = cute.group_modes(gdK, 1, 3)
+                gdV = cute.group_modes(gdV, 1, 3)
+                gdK = gdK[None, n_block_idx]
+                gdV = gdV[None, n_block_idx]
 
             tdVgdVaccum = gmem_thr_copy_dV.partition_S(gdV)
             tdKgdKaccum = gmem_thr_copy_dK.partition_S(gdK)

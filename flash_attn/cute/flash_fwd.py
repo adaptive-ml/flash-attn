@@ -1569,7 +1569,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     if cutlass.const_expr(mPageTable is None):
                         n_block = n_block_max - i - 1
                     else:
-                        n_block = mPageTable[batch_idx, n_block_max - i - 1] if const_expr(mPageTable is not None) else None
+                        tiles_per_page = mK.shape[0] // self.tile_n
+                        page_idx = mPageTable[batch_idx, (n_block_max - i - 1) // tiles_per_page]
+                        residue = (n_block_max - i - 1) % tiles_per_page
+                        n_block = page_idx * tiles_per_page + residue
                     pipeline_k.producer_acquire(kv_producer_state)
                     load_K(src_idx=n_block, producer_state=kv_producer_state)
                     pipeline_v.producer_acquire(kv_producer_state)
