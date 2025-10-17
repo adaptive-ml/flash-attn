@@ -134,15 +134,12 @@ def diff_kv_setup(
     head_dim_rounded = (head_dim + 32 - 1) // 32 * 32
     head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
 
+    device = q.device
+
     if qhead_per_kvhead > 1:
         if page_table is not None:
-            seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
-            if dk_accum is None:
-                dk_accum = torch.zeros(num_pages, num_head_kv, page_size * head_dim_rounded, dtype=torch.float32, device=device)
-            if dv_accum is None:
-                dv_accum = torch.zeros(num_pages, num_head_kv, page_size * head_dim_v_rounded, dtype=torch.float32, device=device)
-            assert dk_accum.shape == (num_pages, num_head_kv, page_size * head_dim_rounded)
-            assert dv_accum.shape == (num_pages, num_head_kv, page_size * head_dim_v_rounded)
+            dk_accum = torch.zeros(num_pages, num_head_kv, page_size * head_dim_rounded, dtype=torch.float32, device=device)
+            dv_accum = torch.zeros(num_pages, num_head_kv, page_size * head_dim_v_rounded, dtype=torch.float32, device=device)
     else:
         dk_accum = dv_accum = None
 
@@ -506,10 +503,17 @@ def diff_kv_runner(
 
         seq_len_remaining -= q_cur.shape[0]
 
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
 
+    seqused_k_tensor = None
     cu_seqlens_k_tensor = None
     # TODO: dlpack seqused_k_tensor
     # TODO: Postprocess on dk_accum, dv_accum if necessary result
+    # dk_accum is (n_pages, head_idx_kv, page_size * d_head)... 
+    # can maybe just pretend this is fixed_len with batch_size=n_pages and seq_len = page_size
+    # ^seems to work, but note that this touches parts of the last page that are supposed to be unfilled 
+    # (don't think it matters though unless we expect those things to be zeroed or something across runs?)
     if qhead_per_kvhead > 1:
         # Postprocess kernel: convert dk_accum & dv_accum from float32 to bf16/fp16
         compile_key_post = (dtype, head_dim, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB)
@@ -518,6 +522,7 @@ def diff_kv_runner(
                 dtype, head_dim, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
             )
             # TODO: check @can_implement
+            # import pdb; pdb.set_trace()
             diff_kv_runner.compile_cache_post[compile_key_post] = cute.compile(
                 fa_bwd_post, dk_accum_tensor, dk_tensor, softmax_scale, cu_seqlens_k_tensor, seqused_k_tensor, current_stream
             )
@@ -545,7 +550,7 @@ diff_kv_runner.compile_cache_post = {}
 if __name__ == "__main__":
     # Only testing causal for now, don't think causal=False should work
     causal = True
-    mha_type = 'mha'
+    mha_type = 'gqa'
     # page_size = 128 if causal else 192
     page_size = 128
     (
@@ -557,7 +562,7 @@ if __name__ == "__main__":
         cu_seqlens_q, 
         cu_seqlens_k 
     ) = generate_args(
-        n_heads=4, 
+        n_heads=8, 
         d_head=128, 
         seq_len=10301,
         dtype=torch.float16,
@@ -565,7 +570,7 @@ if __name__ == "__main__":
         mha_type=mha_type,
     )
 
-    n_chunks = 8 # min(3, ceil_div(qc.shape[0], page_size))
+    n_chunks = 15 # min(3, ceil_div(qc.shape[0], page_size))
 
     # Use the same upstream gradient to compare backward paths
     # good enough for now since assuming headdim = headdim_v
