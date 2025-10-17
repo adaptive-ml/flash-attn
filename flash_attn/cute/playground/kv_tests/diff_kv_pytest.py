@@ -104,7 +104,7 @@ def test_diff_kv(
         out_chunked, 
         lse_chunked, 
         grad_chunked, 
-        dq_chunked
+        dq_chunked,
     ) = chunk(
         qc, 
         out_paged, 

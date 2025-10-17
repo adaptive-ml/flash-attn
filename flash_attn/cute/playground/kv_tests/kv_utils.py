@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Optional, Tuple
 import torch
 
 def ceil_div(a: int, b: int) -> int:
@@ -125,6 +125,7 @@ def chunk(
     list[torch.Tensor],
 ]:
     # Make chunks multiples of page table size (might even be fine without, though bad perf?)
+    # ^ for GQA/MQA we definitely cannot chunk across pages
 
     assert qc.shape[0] == out_paged.shape[0] == lse_paged.shape[1] == grad_paged.shape[0] == dq_paged.shape[0]
     seqlen = qc.shape[0]
@@ -137,11 +138,11 @@ def chunk(
     for chunk_idx in range(n_chunks):
         # TODO: reverse later since last page is partially filled --> not as even as it could be
         pages_in_chunk = pages_per_chunk + 1 if chunk_idx < extra else pages_per_chunk
-        q_chunked.append(qc[offset:offset + (pages_in_chunk) * page_size])
-        out_chunked.append(out_paged[offset:offset + (pages_in_chunk) * page_size])
-        lse_chunked.append(lse_paged[:, offset:offset + (pages_in_chunk) * page_size])
-        grad_chunked.append(grad_paged[offset:offset + (pages_in_chunk) * page_size])
-        dq_chunked.append(dq_paged[offset:offset + (pages_in_chunk) * page_size])
+        q_chunked.append(qc[offset:offset + pages_in_chunk * page_size])
+        out_chunked.append(out_paged[offset:offset + pages_in_chunk * page_size])
+        lse_chunked.append(lse_paged[:, offset:offset + pages_in_chunk * page_size])
+        grad_chunked.append(grad_paged[offset:offset + pages_in_chunk * page_size])
+        dq_chunked.append(dq_paged[offset:offset + pages_in_chunk * page_size])
         offset += pages_in_chunk * page_size
 
     return q_chunked, out_chunked, lse_chunked, grad_chunked, dq_chunked
@@ -153,6 +154,7 @@ def generate_args(
     dtype: torch.dtype = torch.bfloat16,
     page_size: int = 192,
     device: str = "cuda",
+    mha_type: str = "mha"
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor,   # Q0, K0, V0  (packed)
     torch.Tensor, torch.Tensor, torch.Tensor,   # Qc, Kc, Vc  (paged; Qc==Q0)
@@ -169,6 +171,7 @@ def generate_args(
         dtype=dtype,
         page_size=page_size,
         device=device,
+        mha_type=mha_type,
     )
  
 def generate_batched_args(
@@ -180,6 +183,7 @@ def generate_batched_args(
     dtype: torch.dtype = torch.bfloat16,
     page_size: int = 192,
     device: str = "cuda",
+    mha_type: str = "mha",
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor,   # Q0, K0, V0  (packed)
     torch.Tensor, torch.Tensor, torch.Tensor,   # Qc, Kc, Vc  (paged; Qc==Q0)
@@ -204,7 +208,16 @@ def generate_batched_args(
     torch.manual_seed(0)
     assert max_seq_len >= 1
     assert max_seq_len >= min_seq_len
-    H = H_kv = n_heads
+
+    if mha_type == "gqa":
+        H = 3 * n_heads
+        H_kv = n_heads
+    elif mha_type == "mha":
+        H = H_kv = n_heads
+    else: # MQA
+        H = n_heads
+        H_kv = 1
+
     d = d_head
     d_v = d_head
     max_num_pages = ceil_div(max_seq_len, page_size)

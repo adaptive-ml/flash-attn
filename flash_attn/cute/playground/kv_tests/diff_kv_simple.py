@@ -80,7 +80,7 @@ if __name__ == "__main__":
         out_chunked, 
         lse_chunked, 
         grad_chunked, 
-        dq_chunked
+        dq_chunked,
     ) = chunk(
         qc, 
         out_paged, 
